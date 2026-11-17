@@ -226,6 +226,27 @@ def _snap(clip, lines, words, min_len, max_len, duration):
     return round(max(0.0, s - 0.15), 2), round(min(duration, e + tail), 2)
 
 
+def moment_window(moment, duration, before, after):
+    """Fixed-length short centred around a highlight, clamped to the source.
+
+    Near a video boundary, slide the window instead of silently shortening a
+    30-second VOD clip when enough source footage is available.
+    """
+    duration = max(0.0, float(duration))
+    total = before + after
+    start = max(0.0, min(float(moment) - before, max(0.0, duration - total)))
+    return round(start, 2), round(min(duration, start + total), 2)
+
+
+def loudest_second(db, start, end):
+    """Strongest audio peak inside a candidate, on its local video clock."""
+    if len(db) == 0:
+        return max(0.0, (start + end) / 2)
+    a = max(0, min(len(db) - 1, int(math.floor(start))))
+    b = max(a + 1, min(len(db), int(math.ceil(end))))
+    return float(a + int(np.argmax(db[a:b])))
+
+
 def fallback_by_loudness(db, words, n, max_len, duration):
     """No AI available: take the loudest stretches that contain speech."""
     z = loud_zscore(db)
@@ -245,7 +266,7 @@ def fallback_by_loudness(db, words, n, max_len, duration):
     return picks
 
 
-def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=15, max_len=60, log=print):
+def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=15, max_len=60, log=print, *, fixed_vod=False):
     z = loud_zscore(db)
     lines = make_lines(words, z)
     if not lines:
@@ -275,8 +296,16 @@ def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=
         note = "The AI was unavailable, so clips were picked by loudness only."
     clips = []
     for c in sorted(found, key=lambda c: -_num(c.get("score"))):
-        s, e = _snap(c, lines, words, min_len, max_len, duration)
-        if e - s < min(min_len, duration) - 1:
+        if fixed_vod:
+            # A VOD highlight is always a 30s short: 5s of buildup followed
+            # by 25s after its loudest moment. The AI selects candidates, but
+            # their often lengthy proposed start/end never become the cut.
+            peak = loudest_second(db, _num(c.get("start")), _num(c.get("end")))
+            s, e = moment_window(peak, duration, 5.0, 25.0)
+        else:
+            s, e = _snap(c, lines, words, min_len, max_len, duration)
+        required = min(30.0, duration) if fixed_vod else min(min_len, duration)
+        if e - s < required - 1:
             continue
         if _overlaps(s, e, clips):
             continue  # overlaps a better clip
