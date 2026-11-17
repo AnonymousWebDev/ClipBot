@@ -62,6 +62,69 @@ class SegmentTimelineTests(unittest.TestCase):
                        (files[2], 150.0, 156.0), (files[3], 156.0, 162.0)]
             self.assertEqual(continuous_tail(indexed), (150.0, 162.0))
 
+    def test_twitch_hls_clock_reset_does_not_poison_video_clock(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            rows = [
+                "p01_00000.ts,1000,1006",
+                "p01_00001.ts,1006,1012",
+                "p01_00002.ts,3.347,9.347",
+                "p01_00003.ts,9.347,15.347",
+            ]
+            for i in range(4):
+                (folder / f"p01_{i:05d}.ts").write_bytes(b"video")
+            found, seen, origin = index_rows(rows, 0, 0, None, folder)
+            self.assertEqual((seen, origin), (4, 1000.0))
+            self.assertEqual([round(end) for _, _, end in found], [6, 12, 18, 24])
+            self.assertEqual(continuous_tail(found), (0.0, 24.0))
+
+    def test_8920s_outlier_is_skipped_and_later_video_recovers(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            rows = [
+                "p01_00000.ts,0,6",
+                "p01_00001.ts,6,12",
+                "p01_00002.ts,12,18",
+                "p01_00003.ts,18,24",
+                "p01_00004.ts,24,30",
+                "p01_00005.ts,30,30.334",
+                "p01_00006.ts,30.334,8920.816",
+                "p01_00007.ts,3.347,9.347",
+                "p01_00008.ts,9.347,15.347",
+            ]
+            for i in range(9):
+                (folder / f"p01_{i:05d}.ts").write_bytes(b"segment")
+            found, seen, origin = index_rows(rows, 0, 0, None, folder)
+            self.assertEqual((seen, origin), (9, 0.0))
+            self.assertEqual(len(found), 8)  # the damaged monster is excluded
+            self.assertAlmostEqual(latest_video_time(found), 48.334)
+            start, end = continuous_tail(found)
+            self.assertAlmostEqual(start, 36.334)  # don't stitch over the damage
+            self.assertAlmostEqual(end, 48.334)
+
+    def test_scan_after_buffer_prunes_old_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            rows = ["p01_00000.ts,0,6", "p01_00001.ts,6,12", "p01_00002.ts,12,18"]
+            (folder / "p01_00002.ts").write_bytes(b"video")
+            found, seen, _ = index_rows(rows, 2, 0, 0.0, folder)
+            self.assertEqual(seen, 3)
+            self.assertEqual(found[0][1:], (12.0, 18.0))
+
+    def test_overgrown_file_is_not_indexed_as_clip_footage(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            big = folder / "p01_00000.ts"
+            with big.open("wb") as out:
+                out.truncate(41 * 1024 * 1024)
+            small = folder / "p01_00001.ts"
+            small.write_bytes(b"video")
+            found, seen, _ = index_rows(
+                ["p01_00000.ts,0,6", "p01_00001.ts,6,12"], 0, 0, None, folder)
+            self.assertEqual(seen, 2)
+            self.assertEqual(len(found), 1)
+            self.assertEqual(found[0][1:], (6.0, 12.0))
+
     def test_stalled_video_with_live_audio_triggers_reconnect(self):
         # Reproduces the Windows symptom: 128s audio vs a TS output that froze at 30s.
         self.assertTrue(video_stalled(128, 30, 128))
