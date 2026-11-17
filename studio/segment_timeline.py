@@ -53,3 +53,21 @@ def video_diagnostics(audio_seconds, video_seconds, segments):
     return {"audio_sec": round(audio_seconds, 1), "video_sec": round(video_seconds, 1),
             "video_lag_sec": round(lag, 1), "segments": len(segments),
             "video_ready": bool(segments) and lag <= 25.0}
+
+
+def continuous_tail(segments, *, gap_tolerance=2.0):
+    """Earliest start and latest end of the newest continuous saved video run.
+
+    A stale segment from a previous reconnect must not make it look like 30s
+    of recent footage is ready when only one 6s piece exists.
+    """
+    valid = sorted(((start, end) for path, start, end in segments
+                    if end > start and path.is_file()), key=lambda p: (p[1], p[0]))
+    if not valid:
+        return (0.0, 0.0)
+    start, end = valid[-1]
+    for earlier_start, earlier_end in reversed(valid[:-1]):
+        if earlier_end < start - gap_tolerance:
+            break
+        start = min(start, earlier_start)
+    return start, end
