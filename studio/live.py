@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import alerts, auth, brain, chat_highlights, config, creators, ctx, jobs, load, media, rolling_buffer, transcribe, usage
+from . import alerts, auth, brain, chat_highlights, config, creators, ctx, jobs, load, media, rolling_buffer, segment_timeline, transcribe, usage
 
 SESSIONS: dict = {}
 SEG_SEC = 6           # length of each buffer piece
@@ -115,6 +115,8 @@ class Session:
         self.pinned = {}              # clip id -> (start, end), protects queued footage from expiry
         self.seg_clock = 0.0
         self.csv_seen = {}
+        self.csv_origin = {}           # first media timestamp within each ffmpeg subprocess
+        self.part_starts = {}          # stream-clock start of each reconnect
         self.part = 0
         self.chat = collections.Counter()   # second -> messages
         self.chat_total = 0
@@ -140,6 +142,7 @@ class Session:
         self.last_spike = -999.0      # when the last jump was sent to the AI (stream seconds)
         self.base = {}                # running averages the jumps are measured against, shown on the card
         self.spikes = 0
+        self.video_restarts = 0   # FFmpeg restarts after video output freezes but audio continues
 
     # ---------------------------------------------------------------- recording
     def start(self):
@@ -174,6 +177,7 @@ class Session:
 
     def _ingest_loop(self):
         fails = 0
+        stalled_without_video = 0
         url = self.job["source"]["url"]
         while not self.stop_flag.is_set():
             try:
@@ -188,23 +192,33 @@ class Session:
                 continue
             if not self.job.get("uploader"):
                 self.job.update(title=info["title"], uploader=info["uploader"])
-            self.part += 1
             with self.lock:
-                self.seg_clock = max(self.seg_clock, self.samples / SR)
-            p = f"p{self.part:02d}"
-            cmd = ["ffmpeg", "-v", "error", "-reconnect", "1", "-reconnect_streamed", "1",
+                self.part += 1
+                self.part_starts[self.part] = self.samples / SR
+                self.seg_clock = max(self.seg_clock, self.part_starts[self.part])
+                current_part = self.part
+            p = f"p{current_part:02d}"
+            cmd = ["ffmpeg", "-nostdin", "-v", "error", "-reconnect", "1", "-reconnect_streamed", "1",
                    "-reconnect_delay_max", "10"]
             for u in info["urls"]:
                 cmd += ["-i", u]
             a_in = "1:a:0" if len(info["urls"]) > 1 else "0:a:0"
             cmd += ["-map", "0:v:0", "-map", a_in, "-c", "copy", "-f", "segment", "-segment_time", str(SEG_SEC),
-                    "-reset_timestamps", "1", "-segment_format", "mpegts", "-segment_list", f"{p}.csv",
+                    "-reset_timestamps", "1", "-segment_atclocktime", "1",
+                    "-segment_format", "mpegts", "-segment_list", f"{p}.csv",
                     "-segment_list_type", "csv", f"{p}_%05d.ts",
                     "-map", a_in, "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "pipe:1"]
             with open(self.dir / "ffmpeg.log", "ab") as errlog:
                 self.proc = subprocess.Popen(cmd, cwd=self.buf, stdout=subprocess.PIPE, stderr=errlog,
                                              creationflags=media.NO_WINDOW)
                 got = 0
+                restarted_for_video = False
+                process_started = time.monotonic()
+                last_progress_audio = self.samples / SR
+                checked_audio = last_progress_audio
+                last_snapshot = None
+                finalized_audio = last_progress_audio
+                finalized_rows = 0
                 while True:
                     data = self.proc.stdout.read(SR * 2)  # one second of 16-bit mono
                     if not data:
@@ -218,7 +232,73 @@ class Session:
                             self.pending += data
                         self.samples += len(data) // 2
                         self.db.append(level)
-                self.proc.wait()
+                        audio_now = self.samples / SR
+                    if self.stop_flag.is_set():
+                        break
+                    if audio_now - checked_audio < 3:
+                        continue
+                    checked_audio = audio_now
+                    # Clock-time splitting is independent of broken HLS PTS.
+                    # Also restart if FFmpeg writes a growing file indefinitely
+                    # without finishing a segment.
+                    csv_file = self.buf / f"{p}.csv"
+                    try:
+                        row_count = len(csv_file.read_text(errors="ignore").splitlines())
+                    except OSError:
+                        row_count = 0
+                    if row_count > finalized_rows:
+                        finalized_rows = row_count
+                        finalized_audio = audio_now
+                    # The segment CSV only includes *finalized* files. Track
+                    # growing TS bytes too, so long keyframe intervals do not
+                    # cause false stall alerts.
+                    snapshot = segment_timeline.segment_bytes_snapshot(self.buf, p)
+                    if snapshot and (last_snapshot is None or snapshot[0] != last_snapshot[0]
+                                     or snapshot[1] > last_snapshot[1]):
+                        last_snapshot = snapshot
+                        last_progress_audio = audio_now
+                        if self.job.get("stage") == "Reconnecting video":
+                            self.job["stage"] = "Recording"
+                    missing_video = segment_timeline.video_stalled(
+                        audio_now, last_progress_audio, time.monotonic() - process_started)
+                    segment_not_finalized = segment_timeline.video_stalled(
+                        audio_now, finalized_audio, time.monotonic() - process_started,
+                        stall_sec=24, warmup_sec=35)
+                    if missing_video or segment_not_finalized:
+                        self.video_restarts += 1
+                        self.job["stage"] = "Reconnecting video"
+                        errlog.write(
+                            f"\\n[ClipBot] Video segments stopped finalizing while audio continued: "
+                            f"{audio_now:.0f}s audio, "
+                            f"{audio_now - finalized_audio:.0f}s without a finished segment, "
+                            f"{audio_now - last_progress_audio:.0f}s without TS writes; "
+                            f"reconnecting FFmpeg (attempt {self.video_restarts}).\\n".encode()
+                        )
+                        errlog.flush()
+                        restarted_for_video = True
+                        break
+                if self.proc.poll() is None and (restarted_for_video or self.stop_flag.is_set()):
+                    self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=12)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(timeout=5)
+                # FFmpeg may finalize the last CSV row on clean shutdown.
+                self._scan_segments()
+            if self.stop_flag.is_set():
+                break
+            if restarted_for_video:
+                # Do not spin forever when every fresh source stalls before
+                # yielding even two completed segments.
+                with self.lock:
+                    finished = self.csv_seen.get(current_part, 0)
+                stalled_without_video = 0 if finished >= 2 else stalled_without_video + 1
+                if stalled_without_video >= 4:
+                    self.job["error"] = "Live video repeatedly froze after reconnecting. See ffmpeg.log."
+                    break
+                self.stop_flag.wait(3)
+                continue
             fails = 0 if got > SR * 2 * 20 else fails + 1
             if fails >= 3:
                 break
@@ -232,15 +312,18 @@ class Session:
                 f = self.buf / f"p{i:02d}.csv"
                 if not f.exists():
                     continue
-                rows = [r.split(",") for r in f.read_text(encoding="utf-8", errors="ignore").splitlines() if r.count(",") >= 2]
-                for name, a, b in (r[:3] for r in rows[self.csv_seen.get(i, 0):]):
-                    try:
-                        dur = max(0.0, float(b) - float(a))
-                    except ValueError:
-                        continue
-                    self.segments.append((self.buf / name, self.seg_clock, self.seg_clock + dur))
-                    self.seg_clock += dur
-                self.csv_seen[i] = len(rows)
+                # Each reconnect's segment CSV has its own timestamp origin.
+                # Read the actual start/end, not a fabricated cumulative clock.
+                rows = f.read_text(encoding="utf-8", errors="ignore").splitlines()
+                added, seen, origin = segment_timeline.index_rows(
+                    rows, self.csv_seen.get(i, 0), self.part_starts.get(i, 0.0),
+                    self.csv_origin.get(i), self.buf)
+                self.segments.extend(added)
+                self.csv_seen[i] = seen
+                if origin is not None:
+                    self.csv_origin[i] = origin
+                if added:
+                    self.seg_clock = max(self.seg_clock, added[-1][2])
             keep_from = self.seg_clock - self.settings["buffer_min"] * 60
             self.segments = rolling_buffer.prune(self.segments, keep_from, self.pinned)
 
@@ -319,9 +402,13 @@ class Session:
                 return
             self.last_trigger = now
             self.spikes += 1
+            # The 8-second chat window finishes after the reaction starts.
+            # Use its midpoint as the approximate viral moment, leaving 15s
+            # of buildup and 10s after it rather than a minute-long highlight.
+            start, end = brain.moment_window(signal["time"] - 4.0, now + 10.0, 15.0, 10.0)
             clip = {
-                "start": max(0.0, now - 45),
-                "end": now + 15,
+                "start": start,
+                "end": end,
                 "score": signal["score"],
                 "category": "reaction",
                 "hook": "",
@@ -336,13 +423,22 @@ class Session:
             self.manual.append(clip)
 
     def _chat_only_ready(self):
-        """Submit clips only after their 15-second post-spike window is available."""
+        """Queue only after a complete, finalized video range is indexed.
+
+        Audio timestamps may race ahead of video on Twitch. Queueing on audio
+        alone creates jobs for source footage that has not been recorded yet.
+        """
         now = self.samples / SR
+        with self.lock:
+            video_end = segment_timeline.latest_video_time(self.segments)
         for clip in list(self.manual):
             if clip["end"] > now and not self.ended:
                 continue
+            if not self.ended and video_end < clip["end"] - 1:
+                # Keep this pending until FFmpeg finishes the required segment.
+                continue
             self.manual.remove(clip)
-            clip["end"] = min(clip["end"], now)
+            clip["end"] = min(clip["end"], now, video_end)
             if clip["end"] - clip["start"] < 15:
                 continue
             self._add_clip(clip)
@@ -472,6 +568,14 @@ class Session:
                                                      st["decide_mode"] == "either" else "Forced: no clip for a while")
             c["judges"] = {"words": c["score"], "reaction": rs or None, "why": why}
             c["reason"] = f"{c['reason']} ({why.lower()}.)"
+            # The AI judges candidate moments, but it cannot set a lengthy
+            # output duration. Anchor a 25-second short on the strongest
+            # matched reaction; otherwise use the candidate midpoint.
+            strongest = max(match, key=lambda m: m["score"]) if match else None
+            moment = ((strongest["start"] + strongest["end"]) / 2 if strongest else
+                      (c["start"] + c["end"]) / 2)
+            c["start"], c["end"] = brain.moment_window(
+                moment, max(self.t_done, moment + 10.0), 15.0, 10.0)
             self._add_clip(c)
             self._verdict(verdict, "Clipped: " + why.lower())
             added += 1
@@ -506,7 +610,7 @@ class Session:
                     t = new_words[i]["s"]
                     if t - self.last_trigger > 45:
                         self.last_trigger = t
-                        self.manual.append({"start": max(0.0, t - 30), "end": t + 2, "why": f'Someone said "{p}"'})
+                        self.manual.append({"start": max(0.0, t - 15), "end": t + 10, "why": f'Someone said "{p}"'})
 
     def _manual_step(self):
         for req in [m for m in self.manual if m["end"] <= self.t_done or self.ended]:
@@ -525,7 +629,8 @@ class Session:
                  facecam_box=self.settings.get("facecam_box"),
                  gameplay_box=self.settings.get("gameplay_box"),
                  facecam_version=self.settings.get("facecam_version", 0),
-                 captions=False if self.chat_mode else self.job["options"].get("captions", True),
+                 captions=self.job["options"].get("captions", True),
+                 speech_on_render=self.chat_mode,
                  status="queued", version=0, made_at=time.time(),
                  buffer_pinned=True)
         with self.lock:
@@ -556,16 +661,21 @@ class Session:
         deadline = time.time() + 45
         while time.time() < deadline:
             self._scan_segments()
-            if self.ended or (self.segments and self.segments[-1][2] >= clip["end"] + 1):
+            if self.ended or (self.segments and segment_timeline.latest_video_time(self.segments) >= clip["end"] - 0.25):
                 break
             time.sleep(1)
         with self.lock:
             segs = [s for s in self.segments if s[2] > clip["start"] - PAD and s[1] < clip["end"] + PAD and s[0].exists()]
-        if not segs or segs[0][1] > clip["start"] + 2:
-            oldest = round(self.segments[0][1], 1) if self.segments else "none"
+        if not segs or segs[0][1] > clip["start"] + 2 or segs[-1][2] < clip["end"] - 2:
+            with self.lock:
+                video_end = segment_timeline.latest_video_time(self.segments)
+                oldest = self.segments[0][1] if self.segments else 0.0
+                audio_now = self.samples / SR
             clip.update(status="error",
-                        error=f"Recording pieces missing (requested {clip['start']:.1f}s; oldest {oldest}s). "
-                              "Check the stream is recording before clipping.")
+                        error=f"Video segments incomplete: requested {clip['start']:.0f}–"
+                              f"{clip['end']:.0f}s; indexed video reaches {video_end:.0f}s "
+                              f"(oldest {oldest:.0f}s), audio clock {audio_now:.0f}s. "
+                              "Check the buffer folder and ffmpeg.log for recording errors.")
             jobs.save(self.job)
             return False
         if "width" not in self.job:
@@ -619,10 +729,30 @@ class Session:
         return guess
 
     def clip_last(self, seconds):
-        end = self.samples / SR
-        if end < 5:
-            raise ValueError("Nothing has been recorded yet.")
-        request = {"start": max(0.0, end - seconds), "end": end}
+        self._scan_segments()
+        with self.lock:
+            audio_now = self.samples / SR
+            tail_start, video_end = segment_timeline.continuous_tail(self.segments)
+        if video_end < 5:
+            raise ValueError("Video footage is not ready yet: FFmpeg has not finalized any recording segments.")
+        lag = audio_now - video_end
+        if lag > 25:
+            raise ValueError(
+                f"Video recording is {lag:.0f}s behind audio ({video_end:.0f}s video vs "
+                f"{audio_now:.0f}s audio). Clip not queued; check the recording's ffmpeg.log."
+            )
+        # Clip the last *available contiguous* video footage. Reject a
+        # recent six-second island instead of claiming to have 30/60 seconds.
+        end = min(audio_now, video_end)
+        available = max(0.0, end - tail_start)
+        wanted = min(seconds, end)
+        if available + 2 < wanted:
+            raise ValueError(
+                f"Only {available:.0f}s of continuous video is available, but "
+                f"{wanted:.0f}s was requested. The recorder may have dropped "
+                "video segments; check ffmpeg.log."
+            )
+        request = {"start": max(tail_start, end - seconds), "end": end}
         if self.chat_mode:
             # No transcript or AI describe() call exists in low-CPU mode.
             request.update(score=0, category="manual", hook="", title="Manual highlight",
@@ -635,9 +765,10 @@ class Session:
         lines = brain.make_lines([w for w in self.words if w["s"] >= self.t_done - 45])[-5:]
         with self.lock:
             sec = int(elapsed)
+            tail_start, tail_end = segment_timeline.continuous_tail(self.segments)
             self.job.update(
                 duration=elapsed,
-                live={"elapsed": round(elapsed), "buffer_sec": round(self.segments[-1][2] - self.segments[0][1]) if self.segments else 0,
+                live={"elapsed": round(elapsed), "buffer_sec": round(max(0.0, tail_end - tail_start)),
                       "lines": [l["text"] for l in lines], "level": [round(x) for x in self.db[-60:]],
                       "chat": [self.chat.get(t, 0) for t in range(max(0, sec - 60), sec)] if self.chat_on or self.chat_total else None,
                       "checks": self.checks, "skipped": self.skipped, "tokens": self.tokens, "words": len(self.words),
@@ -648,6 +779,10 @@ class Session:
                       "chat_connected": self.chat_on,
                       "chat_spikes": self.spikes,
                       "chat_baseline": self.base,
+                      "video": {**segment_timeline.video_diagnostics(
+                          elapsed, tail_end, self.segments),
+                          "tail_sec": round(max(0.0, tail_end - tail_start), 1),
+                          "restarts": self.video_restarts},
                       "pending_clips": len(self.manual)})
         jobs.save(self.job)
 

@@ -6,6 +6,7 @@ import math
 import queue
 import shutil
 import threading
+import tempfile
 import time
 import traceback
 import uuid
@@ -415,9 +416,23 @@ def render_one(job, clip, words):
                 clip.update(status="layout_review", error=None)
                 save(job)
                 return
-        near = _caption_words(job, clip, words, off) if clip.get("captions", True) else []
+        near = []
+        if clip.get("captions", True):
+            if job.get("kind") == "live" and (clip.get("speech_on_render")
+                    or (job.get("live") or {}).get("mode") == "chat" or not words):
+                # Chat-driven highlights are not transcribed during recording.
+                # Speech is recognized locally from the saved clip only, never
+                # by a paid AI service and never from the entire stream.
+                clip["render_stage"] = "Transcribing speech"
+                save(job)
+                near = _live_caption_words(job, clip, src, local["start"], local["end"])
+            else:
+                near = _caption_words(job, clip, words, off)
+        clip["render_stage"] = "Rendering video"
+        save(job)
         out = render.render_clip(src, d / "clips", clip["id"], local, near, job["width"], job["height"])
         clip.update(out, status="done", version=clip.get("version", 0) + 1, error=None)
+        clip.pop("render_stage", None)
         post = {k: clip[k] for k in ("title", "description", "hashtags", "hook", "start", "end", "score")}
         (d / "clips" / f"{clip['id']}.json").write_text(json.dumps(post, indent=1), encoding="utf-8")
         if clip["version"] == 1:
@@ -431,8 +446,40 @@ def render_one(job, clip, words):
                     traceback.print_exc()
     except Exception as e:  # noqa: BLE001
         clip.update(status="error", error=safe.friendly(e, 400))
+        clip.pop("render_stage", None)
         creators.log(job["creator"], f"Clip failed: {safe.friendly(e, 200)}")
     save(job)
+
+
+def _live_caption_words(job, clip, src, start, end):
+    """Transcribe just this saved live clip with the local speech model.
+
+    The transcript is cached in source-relative seconds so later facecam edits,
+    trims and re-renders do not run speech recognition again. No paid AI calls,
+    caption translation, or full-stream transcription are involved.
+    """
+    cache = Path(job["dir"]) / "clips" / f"{clip['id']}.speech.json"
+    stat = src.stat()
+    source_id = {"name": src.name, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    words = None
+    try:
+        saved = json.loads(cache.read_text(encoding="utf-8"))
+        if saved.get("source") == source_id and isinstance(saved.get("words"), list):
+            words = saved["words"]
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    if words is None:
+        # Temporary files go in a short system path to avoid the Windows
+        # 260-character FFmpeg filter/path restriction.
+        with tempfile.TemporaryDirectory(prefix="pk-speech-") as temp:
+            wav = Path(temp) / "speech.wav"
+            media.extract_audio(src, wav)
+            words = transcribe.transcribe(media.load_audio(wav))
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"source": source_id, "words": words}), encoding="utf-8")
+        tmp.replace(cache)
+    return [dict(w) for w in roman.words(words) if start - 0.05 <= w["s"] < end]
 
 
 def _caption_words(job, clip, words, off):
@@ -733,7 +780,8 @@ def _run_job(job):
         quota = max(1, math.ceil(left / (len(blocks) - bi)))
         s0 = int((a - lo) / 16000)
         found, ai = brain.find_clips(bw, db[s0: s0 + int((b - a) / 16000) + 1], (b - a) / 16000, job["title"],
-                                     job["uploader"], quota, int(o["min_len"]), int(o["max_len"]), notes.append)
+                                     job["uploader"], quota, 15, 30, notes.append,
+                                     fixed_vod=True)
         tokens += ai.get("tokens", 0)
         model = ai.get("model") or model
         if ai.get("note"):
@@ -774,6 +822,28 @@ def _run_job(job):
     creators.log(job["creator"], f"Video finished with {len(clips)} clips in {round(time.time() - t0)}s: {job['title']}")
 
 
+def _words_for_remake(job, clip):
+    """Read the saved transcript before re-making a clip.
+
+    Chat-only live recordings deliberately have no words.json. Missing words
+    must produce a useful error rather than strand a clip in "queued".
+    """
+    if not clip.get("captions", True):
+        return []
+    transcript = Path(job["dir"]) / "words.json"
+    if not transcript.is_file():
+        if job.get("kind") == "live":
+            return []  # speech comes from the saved clip during render_one()
+        raise ValueError("This video's transcript is missing. Re-process the original video before remaking.")
+    try:
+        words = json.loads(transcript.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("The saved transcript could not be read. Please re-process the source video.") from exc
+    if not isinstance(words, list):
+        raise ValueError("The saved transcript is invalid. Please re-process the source video.")
+    return words
+
+
 def _worker(quick_only=False):
     while True:
         kind, a, cid = _q.get(quick_only)
@@ -794,9 +864,7 @@ def _worker(quick_only=False):
                 _run_job(job)
             else:
                 clip = next(c for c in job["clips"] if c["id"] == cid)
-                words = []
-                if clip.get("captions", True):
-                    words = json.loads((Path(job["dir"]) / "words.json").read_text(encoding="utf-8"))
+                words = _words_for_remake(job, clip)
                 render_one(job, clip, words)
         except Exception as e:  # noqa: BLE001
             (Path(job["dir"]) / "error.log").write_text(traceback.format_exc(), encoding="utf-8")
@@ -806,6 +874,14 @@ def _worker(quick_only=False):
                         c.update(status="error", error="The video stopped before this clip was made.")
                 _set(job, status="error", error=safe.friendly(e), stage="Stopped")
                 creators.log(job["creator"], f"Video failed: {safe.friendly(e)[:200]}")
+            else:
+                # This includes failures *before* render_one marks it rendering
+                # (missing/corrupt transcript, source paths, unexpected errors).
+                # Never leave the UI stuck on "Preparing clip..." indefinitely.
+                clip = next((c for c in job.get("clips", []) if c.get("id") == cid), None)
+                if clip is not None:
+                    clip.update(status="error", error=safe.friendly(e, 400))
+                    save(job)
         finally:
             ctx._uid.reset(token)
             if kind == "job":
