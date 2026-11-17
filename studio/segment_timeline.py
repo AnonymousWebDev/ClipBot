@@ -71,3 +71,27 @@ def continuous_tail(segments, *, gap_tolerance=2.0):
             break
         start = min(start, earlier_start)
     return start, end
+
+
+def video_stalled(audio_now, last_video_progress_audio, process_age, *, stall_sec=25, warmup_sec=35):
+    """True when audio is advancing but the TS recorder has stopped writing.
+
+    A single live stream may need up to several GOPs to start producing TS;
+    require both a warm-up and a sustained period with no new TS bytes.
+    This detects a frozen *video output*, not a disconnected audio process.
+    """
+    return (process_age >= warmup_sec
+            and audio_now - last_video_progress_audio >= stall_sec)
+
+
+def segment_bytes_snapshot(folder, prefix):
+    """(filename, size) of newest nonempty TS file; no stream URLs are read."""
+    files = sorted(folder.glob(prefix + "_*.ts"))
+    for path in reversed(files):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > 0:
+            return (path.name, size)
+    return None
