@@ -1767,7 +1767,7 @@ function liveHtml(j) {
     </div>
     ${L.video ? `<div class="${lagWarning ? "err" : "help"}" style="margin:10px 16px;padding:8px">
       Recorded video: ${fmt(v.video_sec || 0)} · Audio clock: ${fmt(v.audio_sec || 0)}
-      · Continuous video: ${fmt(v.tail_sec || 0)}
+      · Continuous video: ${fmt(v.tail_sec || 0)}${v.restarts ? ` · Recorder reconnected ${v.restarts} time${v.restarts === 1 ? "" : "s"}` : ""}
       ${lagWarning ? " · Video is behind audio. Wait for FFmpeg segments or check ffmpeg.log in the recording folder." : ""}
       </div>` : ""}
     ${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}</div>
