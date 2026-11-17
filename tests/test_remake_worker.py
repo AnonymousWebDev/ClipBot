@@ -76,6 +76,33 @@ class RemakeWorkerTests(unittest.TestCase):
                 jobs._live_caption_words({"kind": "live", "dir": d}, clip, src, 0, 30)
             self.assertEqual(speech.call_count, 2)
 
+    def test_chat_live_render_uses_local_words_without_paid_ai(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "clips").mkdir()
+            src = root / "clips" / "clip1.src.ts"
+            src.write_bytes(b"recorded clip")
+            clip = {"id": "clip1", "src": str(src), "src_offset": 100.0,
+                    "start": 105.0, "end": 125.0, "captions": True,
+                    "speech_on_render": True, "layout": "blur", "style": "bounce",
+                    "version": 1, "title": "", "description": "", "hashtags": [],
+                    "hook": "", "score": 0}
+            job = {"kind": "live", "dir": d, "clips": [clip], "width": 1280,
+                   "height": 720, "creator": None}
+            spoken = [{"w": "hello", "s": 5.0, "e": 5.4}]
+            with mock.patch.object(jobs, "save"), \
+                 mock.patch.object(jobs, "_live_caption_words", return_value=spoken) as speech, \
+                 mock.patch.object(jobs.render, "render_clip",
+                                   return_value={"file": "clip1.mp4", "cover": "clip1.jpg"}) as renderer, \
+                 mock.patch.object(jobs.brain, "english_captions",
+                                   side_effect=AssertionError("paid AI used")):
+                jobs.render_one(job, clip, [])
+            self.assertEqual(clip["status"], "done", clip.get("error"))
+            self.assertEqual(clip["version"], 2)
+            speech.assert_called_once_with(job, clip, src, 5.0, 25.0)
+            self.assertEqual(renderer.call_args.args[4], spoken)
+            self.assertNotIn("render_stage", clip)
+
     def test_quick_worker_marks_error_if_dispatch_crashes(self):
         class OneJob:
             def __init__(self):
