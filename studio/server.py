@@ -1510,6 +1510,8 @@ def add_posts(body: dict = Body(...)):
     clip = next((c for c in job["clips"] if c["id"] == body.get("clip")), None) if job else None
     if not clip or clip.get("status") != "done":
         raise HTTPException(404, "That clip is not ready")
+    if clip.get("requires_layout_review"):
+        raise HTTPException(409, "This clip needs webcam layout review before posting.")
     made = posting.enqueue(job, clip, [str(a) for a in body.get("accounts", [])][:20], now=bool(body.get("now")))
     if not made:
         raise HTTPException(400, "Nothing was queued. Pick at least one account this clip has not already gone to.")
