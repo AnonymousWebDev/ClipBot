@@ -572,7 +572,7 @@ class Session:
         deadline = time.time() + 45
         while time.time() < deadline:
             self._scan_segments()
-            if self.ended or (self.segments and self.segments[-1][2] >= clip["end"] + 1):
+            if self.ended or (self.segments and segment_timeline.latest_video_time(self.segments) >= clip["end"] - 0.25):
                 break
             time.sleep(1)
         with self.lock:
@@ -643,7 +643,7 @@ class Session:
         self._scan_segments()
         with self.lock:
             audio_now = self.samples / SR
-            video_end = segment_timeline.latest_video_time(self.segments)
+            tail_start, video_end = segment_timeline.continuous_tail(self.segments)
         if video_end < 5:
             raise ValueError("Video footage is not ready yet: FFmpeg has not finalized any recording segments.")
         lag = audio_now - video_end
@@ -652,10 +652,18 @@ class Session:
                 f"Video recording is {lag:.0f}s behind audio ({video_end:.0f}s video vs "
                 f"{audio_now:.0f}s audio). Clip not queued; check the recording's ffmpeg.log."
             )
-        # Clip the last *available* video footage; completed segments are
-        # immediately usable and do not depend on audio clock alignment.
+        # Clip the last *available contiguous* video footage. Reject a
+        # recent six-second island instead of claiming to have 30/60 seconds.
         end = min(audio_now, video_end)
-        request = {"start": max(0.0, end - seconds), "end": end}
+        available = max(0.0, end - tail_start)
+        wanted = min(seconds, end)
+        if available + 2 < wanted:
+            raise ValueError(
+                f"Only {available:.0f}s of continuous video is available, but "
+                f"{wanted:.0f}s was requested. The recorder may have dropped "
+                "video segments; check ffmpeg.log."
+            )
+        request = {"start": max(tail_start, end - seconds), "end": end}
         if self.chat_mode:
             # No transcript or AI describe() call exists in low-CPU mode.
             request.update(score=0, category="manual", hook="", title="Manual highlight",
