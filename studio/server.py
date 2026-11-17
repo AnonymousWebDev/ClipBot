@@ -1163,17 +1163,32 @@ def creator_avatar(cid: str, p: str = ""):
 
 
 @app.get("/api/creators/{cid}/layout/frame")
-def creator_layout_frame(cid: str):
-    """One real frame from the owner's recorded media for the webcam rectangle editor.
+def creator_layout_frame(cid: str, job: str = "", clip: str = ""):
+    """Frame from a specifically owned raw clip, or a recent recorded stream.
 
-    Never downloads a fresh stream or accepts an arbitrary filesystem path.
+    The source path always comes from a job belonging to the signed-in user.
     """
     if not creators.get(cid):
         raise HTTPException(404, "No such creator")
     _throttle("layoutframe:" + ctx.uid(), 30, 60)
     source = None
+    seek = 1.0
+    if job or clip:
+        if not job or not clip:
+            raise HTTPException(400, "Both job and clip must be supplied.")
+        found = _job_or_404(job)
+        if found.get("creator") != cid:
+            raise HTTPException(404, "Clip is not part of this creator.")
+        selected = next((c for c in found.get("clips", []) if c.get("id") == clip), None)
+        if not selected or not selected.get("src"):
+            raise HTTPException(404, "This clip has no retained raw footage.")
+        source = Path(selected["src"])
+        if not source.is_file():
+            raise HTTPException(404, "The raw clip is no longer available.")
+        seek = max(0.0, float(selected["start"]) - float(selected.get("src_offset") or 0)
+                   + (float(selected["end"]) - float(selected["start"])) / 2)
     session = live.active_for(cid)
-    if session:
+    if source is None and session:
         session._scan_segments()
         with session.lock:
             source = next((p for p, a, b in reversed(session.segments) if p.is_file()), None)
@@ -1189,7 +1204,7 @@ def creator_layout_frame(cid: str):
         raise HTTPException(404, "No recorded frame yet. Record the streamer or make a clip first.")
     try:
         proc = subprocess.run(
-            ["ffmpeg", "-nostdin", "-v", "error", "-ss", "1", "-i", str(source),
+            ["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{seek:.2f}", "-i", str(source),
              "-frames:v", "1", "-vf", "scale=960:-2:flags=fast_bilinear",
              "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "5", "pipe:1"],
             capture_output=True, timeout=12, creationflags=media.NO_WINDOW,
