@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import alerts, auth, brain, config, creators, ctx, jobs, load, media, transcribe, usage
+from . import alerts, auth, brain, chat_highlights, config, creators, ctx, jobs, load, media, transcribe, usage
 
 SESSIONS: dict = {}
 SEG_SEC = 6           # length of each buffer piece
@@ -92,6 +92,7 @@ def mine(jid):
 class Session:
     def __init__(self, job, settings):
         self.job, self.settings = job, settings
+        self.chat_mode = settings.get("highlight_mode", "chat") == "chat"
         self.dir = Path(job["dir"])
         self.buf = self.dir / "buffer"
         self.buf.mkdir(exist_ok=True)
@@ -116,7 +117,10 @@ class Session:
         self.part = 0
         self.chat = collections.Counter()   # second -> messages
         self.chat_total = 0
+        self.chat_users = {}          # stream-second -> capped set of distinct chatters
+        self.chat_reactions = collections.Counter()
         self.chat_on = False
+        self.last_chat_check = -1
         self.last_check = 0.0
         self.words_at_check = 0
         self.checks = 0
@@ -209,7 +213,8 @@ class Session:
                     x = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                     level = float(20 * np.log10(np.sqrt((x ** 2).mean() + 1e-10))) if len(x) else -100.0
                     with self.lock:
-                        self.pending += data
+                        if not self.chat_mode:
+                            self.pending += data
                         self.samples += len(data) // 2
                         self.db.append(level)
                 self.proc.wait()
@@ -261,9 +266,18 @@ class Session:
                         if line.startswith(b"PING"):
                             s.sendall(b"PONG :tmi.twitch.tv\r\n")
                         elif b" PRIVMSG #" in line:
+                            message = chat_highlights.parse_twitch_privmsg(line)
+                            if not message:
+                                continue
+                            username, text = message
                             with self.lock:
-                                self.chat[int(self.samples / SR)] += 1
+                                second = int(self.samples / SR)
+                                self.chat[second] += 1
                                 self.chat_total += 1
+                                users = self.chat_users.setdefault(second, set())
+                                if len(users) < 500:  # bounded memory during mass chat activity
+                                    users.add(username)
+                                self.chat_reactions[second] += chat_highlights.reaction_count(text)
                 s.close()
             except Exception:  # noqa: BLE001
                 pass
@@ -279,6 +293,59 @@ class Session:
         a, b = int(s), int(e) + 6
         rate = sum(self.chat.get(t, 0) for t in range(a, b + 1)) / (b - a + 1)
         return rate > max(3 * avg, 1.0)
+
+    def _chat_only_step(self):
+        """Find chat spikes without AI or local speech transcription."""
+        with self.lock:
+            now = int(self.samples / SR)
+            if now == self.last_chat_check:
+                return
+            self.last_chat_check = now
+            # Only recent seconds are relevant; do not retain six hours of chat metadata.
+            cutoff = now - 240
+            for table in (self.chat, self.chat_users, self.chat_reactions):
+                for second in list(table):
+                    if second < cutoff:
+                        del table[second]
+            signal = chat_highlights.evaluate_chat_spike(
+                self.chat, self.chat_users, self.chat_reactions, now,
+            )
+            if signal:
+                self.base = {"chat": signal["baseline"], "chat_now": signal["rate"],
+                             "ratio": signal["ratio"], "unique": signal["unique_chatters"]}
+            if not signal or now - self.last_trigger < max(60, self.settings.get("min_gap_min", 2) * 60):
+                return
+            if self.n >= self.settings.get("live_per_hour", 4) * max(1, (now + 3599) // 3600):
+                return
+            self.last_trigger = now
+            self.spikes += 1
+            clip = {
+                "start": max(0.0, now - 45),
+                "end": now + 15,
+                "score": signal["score"],
+                "category": "reaction",
+                "hook": "",
+                "title": "Chat spike highlight",
+                "description": "",
+                "hashtags": [],
+                "highlight_words": [],
+                "reason": f"Chat {signal['ratio']}x normal, {signal['unique_chatters']} unique chatters",
+                "signal": signal,
+                "requires_layout_review": True,
+            }
+            self.manual.append(clip)
+
+    def _chat_only_ready(self):
+        """Submit clips only after their 15-second post-spike window is available."""
+        now = self.samples / SR
+        for clip in list(self.manual):
+            if clip["end"] > now and not self.ended:
+                continue
+            self.manual.remove(clip)
+            clip["end"] = min(clip["end"], now)
+            if clip["end"] - clip["start"] < 15:
+                continue
+            self._add_clip(clip)
 
     # ---------------------------------------------------------------- analysis
     def _transcribe_step(self):
@@ -455,7 +522,8 @@ class Session:
     def _add_clip(self, c):
         self.n += 1
         c.update(id=f"clip{self.n:03d}", style=self.settings["style"], layout=self.settings["layout"],
-                 captions=self.job["options"].get("captions", True), status="queued", version=0, made_at=time.time())
+                 captions=False if self.chat_mode else self.job["options"].get("captions", True),
+                 status="queued", version=0, made_at=time.time())
         with self.lock:
             self.job["clips"].append(c)
         jobs.save(self.job)
@@ -491,7 +559,7 @@ class Session:
         finally:
             lst.unlink(missing_ok=True)
         dur = segs[-1][2] - segs[0][1]
-        offset = self._align(src, segs[0][1] + self.clock_fix, dur)
+        offset = segs[0][1] if self.chat_mode else self._align(src, segs[0][1] + self.clock_fix, dur)
         self.clock_fix = offset - segs[0][1]  # the two clocks drift ~4 s an hour; start the next clip from here
         clip.update(src=str(src), src_offset=round(offset, 2), src_end=round(offset + dur, 2))
         clip["start"] = max(clip["start"], clip["src_offset"])
@@ -557,11 +625,20 @@ class Session:
                     if time.time() - self.started_at > config.MAX_LIVE_HOURS * 3600:
                         self.stop(f"Stopped after {config.MAX_LIVE_HOURS:g} hours, the longest one recording can run")
                 self._scan_segments()
-                busy = self._transcribe_step()
+                busy = self._transcribe_step() if not self.chat_mode else False
                 if not started and self.samples:
                     started = True
                     self.job.update(status="live", stage="Recording")
                     creators.log(cid, f"Recording started: {self.job['title']}")
+                if self.chat_mode:
+                    self._chat_only_step()
+                    self._chat_only_ready()
+                    self._publish()
+                    if not busy:
+                        time.sleep(1)
+                    if self.user_stopped or (self.ended and not self.manual):
+                        break
+                    continue
                 self._manual_step()
                 # Three ways the AI is asked: on the creator's schedule (every N minutes), and always, when the
                 # stream suddenly gets louder or chat busier, or when someone says "clip".
