@@ -27,6 +27,16 @@ class RemakeWorkerTests(unittest.TestCase):
             self.assertEqual(jobs._words_for_remake({"kind": "video", "dir": d},
                                                     {"captions": True}), words)
 
+    def test_live_missing_transcript_rejected_before_queueing(self):
+        with tempfile.TemporaryDirectory() as d:
+            clip = {"id": "clip1", "status": "done", "start": 0.0, "end": 30.0,
+                    "captions": False, "layout": "blur", "style": "bounce"}
+            job = {"kind": "live", "dir": d, "clips": [clip]}
+            with mock.patch.object(jobs, "_jobs", {"test-job": job}):
+                with self.assertRaisesRegex(ValueError, "Turn off Generate captions"):
+                    jobs.request_render("test-job", "clip1", {"captions": True})
+            self.assertEqual(clip["status"], "done")
+
     def test_quick_worker_marks_error_if_dispatch_crashes(self):
         class OneJob:
             def __init__(self):
