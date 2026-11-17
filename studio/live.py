@@ -617,7 +617,8 @@ class Session:
                  facecam_box=self.settings.get("facecam_box"),
                  gameplay_box=self.settings.get("gameplay_box"),
                  facecam_version=self.settings.get("facecam_version", 0),
-                 captions=False if self.chat_mode else self.job["options"].get("captions", True),
+                 captions=self.job["options"].get("captions", True),
+                 speech_on_render=self.chat_mode,
                  status="queued", version=0, made_at=time.time(),
                  buffer_pinned=True)
         with self.lock:
