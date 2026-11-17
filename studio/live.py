@@ -402,9 +402,13 @@ class Session:
                 return
             self.last_trigger = now
             self.spikes += 1
+            # The 8-second chat window finishes after the reaction starts.
+            # Use its midpoint as the approximate viral moment, leaving 15s
+            # of buildup and 10s after it rather than a minute-long highlight.
+            start, end = brain.moment_window(signal["time"] - 4.0, now + 10.0, 15.0, 10.0)
             clip = {
-                "start": max(0.0, now - 45),
-                "end": now + 15,
+                "start": start,
+                "end": end,
                 "score": signal["score"],
                 "category": "reaction",
                 "hook": "",
@@ -564,6 +568,14 @@ class Session:
                                                      st["decide_mode"] == "either" else "Forced: no clip for a while")
             c["judges"] = {"words": c["score"], "reaction": rs or None, "why": why}
             c["reason"] = f"{c['reason']} ({why.lower()}.)"
+            # The AI judges candidate moments, but it cannot set a lengthy
+            # output duration. Anchor a 25-second short on the strongest
+            # matched reaction; otherwise use the candidate midpoint.
+            strongest = max(match, key=lambda m: m["score"]) if match else None
+            moment = ((strongest["start"] + strongest["end"]) / 2 if strongest else
+                      (c["start"] + c["end"]) / 2)
+            c["start"], c["end"] = brain.moment_window(
+                moment, max(self.t_done, moment + 10.0), 15.0, 10.0)
             self._add_clip(c)
             self._verdict(verdict, "Clipped: " + why.lower())
             added += 1
@@ -598,7 +610,7 @@ class Session:
                     t = new_words[i]["s"]
                     if t - self.last_trigger > 45:
                         self.last_trigger = t
-                        self.manual.append({"start": max(0.0, t - 30), "end": t + 2, "why": f'Someone said "{p}"'})
+                        self.manual.append({"start": max(0.0, t - 15), "end": t + 10, "why": f'Someone said "{p}"'})
 
     def _manual_step(self):
         for req in [m for m in self.manual if m["end"] <= self.t_done or self.ended]:
