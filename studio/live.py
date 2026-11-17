@@ -676,9 +676,10 @@ class Session:
         lines = brain.make_lines([w for w in self.words if w["s"] >= self.t_done - 45])[-5:]
         with self.lock:
             sec = int(elapsed)
+            tail_start, tail_end = segment_timeline.continuous_tail(self.segments)
             self.job.update(
                 duration=elapsed,
-                live={"elapsed": round(elapsed), "buffer_sec": round(self.segments[-1][2] - self.segments[0][1]) if self.segments else 0,
+                live={"elapsed": round(elapsed), "buffer_sec": round(max(0.0, tail_end - tail_start)),
                       "lines": [l["text"] for l in lines], "level": [round(x) for x in self.db[-60:]],
                       "chat": [self.chat.get(t, 0) for t in range(max(0, sec - 60), sec)] if self.chat_on or self.chat_total else None,
                       "checks": self.checks, "skipped": self.skipped, "tokens": self.tokens, "words": len(self.words),
@@ -689,8 +690,9 @@ class Session:
                       "chat_connected": self.chat_on,
                       "chat_spikes": self.spikes,
                       "chat_baseline": self.base,
-                      "video": segment_timeline.video_diagnostics(
-                          elapsed, segment_timeline.latest_video_time(self.segments), self.segments),
+                      "video": {**segment_timeline.video_diagnostics(
+                          elapsed, tail_end, self.segments),
+                          "tail_sec": round(max(0.0, tail_end - tail_start), 1)},
                       "pending_clips": len(self.manual)})
         jobs.save(self.job)
 
