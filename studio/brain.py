@@ -300,7 +300,11 @@ def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=
             # A VOD highlight is always a 30s short: 5s of buildup followed
             # by 25s after its loudest moment. The AI selects candidates, but
             # their often lengthy proposed start/end never become the cut.
-            peak = loudest_second(db, _num(c.get("start")), _num(c.get("end")))
+            candidate_start = _num(c.get("start"), -1.0)
+            candidate_end = _num(c.get("end"), -1.0)
+            if candidate_start < 0 or candidate_start >= duration or candidate_end <= candidate_start:
+                continue
+            peak = loudest_second(db, candidate_start, candidate_end)
             s, e = moment_window(peak, duration, 5.0, 25.0)
         else:
             s, e = _snap(c, lines, words, min_len, max_len, duration)
