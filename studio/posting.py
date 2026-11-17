@@ -91,8 +91,8 @@ def enqueue(job, clip, account_ids, now=False) -> list:
 def on_clip_ready(job, clip):
     """Called once when a clip first finishes rendering."""
     # Chat-only clips need facecam layout validation before unattended posting.
-    if clip.get("requires_layout_review"):
-        return
+    if clip.get("requires_layout_review") or (clip.get("layout_check") or {}).get("status") == "manual":
+        return  # manually approved clips only post after the user explicitly requests it
     c = creators.get(job["creator"])
     if not c or not c["autopost"] or not c["accounts"]:
         return
