@@ -204,7 +204,8 @@ class Session:
                 cmd += ["-i", u]
             a_in = "1:a:0" if len(info["urls"]) > 1 else "0:a:0"
             cmd += ["-map", "0:v:0", "-map", a_in, "-c", "copy", "-f", "segment", "-segment_time", str(SEG_SEC),
-                    "-reset_timestamps", "1", "-segment_format", "mpegts", "-segment_list", f"{p}.csv",
+                    "-reset_timestamps", "1", "-segment_atclocktime", "1",
+                    "-segment_format", "mpegts", "-segment_list", f"{p}.csv",
                     "-segment_list_type", "csv", f"{p}_%05d.ts",
                     "-map", a_in, "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "pipe:1"]
             with open(self.dir / "ffmpeg.log", "ab") as errlog:
@@ -216,6 +217,8 @@ class Session:
                 last_progress_audio = self.samples / SR
                 checked_audio = last_progress_audio
                 last_snapshot = None
+                finalized_audio = last_progress_audio
+                finalized_rows = 0
                 while True:
                     data = self.proc.stdout.read(SR * 2)  # one second of 16-bit mono
                     if not data:
@@ -235,6 +238,17 @@ class Session:
                     if audio_now - checked_audio < 3:
                         continue
                     checked_audio = audio_now
+                    # Clock-time splitting is independent of broken HLS PTS.
+                    # Also restart if FFmpeg writes a growing file indefinitely
+                    # without finishing a segment.
+                    csv_file = self.buf / f"{p}.csv"
+                    try:
+                        row_count = len(csv_file.read_text(errors="ignore").splitlines())
+                    except OSError:
+                        row_count = 0
+                    if row_count > finalized_rows:
+                        finalized_rows = row_count
+                        finalized_audio = audio_now
                     # The segment CSV only includes *finalized* files. Track
                     # growing TS bytes too, so long keyframe intervals do not
                     # cause false stall alerts.
@@ -245,14 +259,19 @@ class Session:
                         last_progress_audio = audio_now
                         if self.job.get("stage") == "Reconnecting video":
                             self.job["stage"] = "Recording"
-                    if segment_timeline.video_stalled(audio_now, last_progress_audio,
-                                                       time.monotonic() - process_started):
+                    missing_video = segment_timeline.video_stalled(
+                        audio_now, last_progress_audio, time.monotonic() - process_started)
+                    segment_not_finalized = segment_timeline.video_stalled(
+                        audio_now, finalized_audio, time.monotonic() - process_started,
+                        stall_sec=24, warmup_sec=35)
+                    if missing_video or segment_not_finalized:
                         self.video_restarts += 1
                         self.job["stage"] = "Reconnecting video"
                         errlog.write(
-                            f"\\n[ClipBot] Video output stalled while audio continued: "
-                            f"{audio_now:.0f}s audio, no TS writes for "
-                            f"{audio_now - last_progress_audio:.0f}s; "
+                            f"\\n[ClipBot] Video segments stopped finalizing while audio continued: "
+                            f"{audio_now:.0f}s audio, "
+                            f"{audio_now - finalized_audio:.0f}s without a finished segment, "
+                            f"{audio_now - last_progress_audio:.0f}s without TS writes; "
                             f"reconnecting FFmpeg (attempt {self.video_restarts}).\\n".encode()
                         )
                         errlog.flush()
