@@ -1163,16 +1163,21 @@ def creator_avatar(cid: str, p: str = ""):
 
 
 @app.get("/api/creators/{cid}/layout/frame")
-def creator_layout_frame(cid: str, job: str = "", clip: str = ""):
-    """Frame from a specifically owned raw clip, or a recent recorded stream.
+def creator_layout_frame(cid: str, job: str = "", clip: str = "", portrait: int = 0):
+    """Authenticated frame from a specific clip, even while its lossless copy is queued.
 
-    The source path always comes from a job belonging to the signed-in user.
+    The source is always from the current user's recorded job, never an arbitrary
+    path or a downloaded URL. portrait=1 produces a small 9:16 layout preview.
     """
-    if not creators.get(cid):
+    creator = creators.get(cid)
+    if not creator:
         raise HTTPException(404, "No such creator")
-    _throttle("layoutframe:" + ctx.uid(), 30, 60)
+    _throttle("layoutframe:" + ctx.uid(), 60, 60)
     source = None
-    seek = 1.0
+    selected = None
+    found = None
+    seek = 0.8
+    session = live.active_for(cid)
     if job or clip:
         if not job or not clip:
             raise HTTPException(400, "Both job and clip must be supplied.")
@@ -1180,40 +1185,87 @@ def creator_layout_frame(cid: str, job: str = "", clip: str = ""):
         if found.get("creator") != cid:
             raise HTTPException(404, "Clip is not part of this creator.")
         selected = next((c for c in found.get("clips", []) if c.get("id") == clip), None)
-        if not selected or not selected.get("src"):
-            raise HTTPException(404, "This clip has no retained raw footage.")
-        source = Path(selected["src"])
-        if not source.is_file():
-            raise HTTPException(404, "The raw clip is no longer available.")
-        seek = max(0.0, float(selected["start"]) - float(selected.get("src_offset") or 0)
-                   + (float(selected["end"]) - float(selected["start"])) / 2)
-    session = live.active_for(cid)
-    if source is None and session:
+        if not selected:
+            raise HTTPException(404, "No such clip")
+        midpoint = (float(selected["start"]) + float(selected["end"])) / 2
+        if selected.get("src") and Path(selected["src"]).is_file():
+            source = Path(selected["src"])
+            seek = max(0.0, midpoint - float(selected.get("src_offset") or 0))
+        elif session and session.job["id"] == job:
+            # A clip waiting for the render worker still has its raw segments pinned.
+            session._scan_segments()
+            with session.lock:
+                match = next(((p, a, b) for p, a, b in session.segments
+                              if a <= midpoint < b and p.is_file()), None)
+                if match is None:
+                    match = next(((p, a, b) for p, a, b in reversed(session.segments)
+                                  if a < selected["end"] and b > selected["start"] and p.is_file()), None)
+            if match:
+                source, a, b = match
+                seek = min(max(0.0, midpoint - a), max(0.0, b - a - 0.25))
+        if source is None:
+            raise HTTPException(404, "Waiting for raw footage. Try again after a segment finishes.")
+    elif session:
         session._scan_segments()
         with session.lock:
             source = next((p for p, a, b in reversed(session.segments) if p.is_file()), None)
     if source is None:
-        for job in reversed(jobs.list_jobs()):
-            if job.get("creator") != cid:
+        for record in reversed(jobs.list_jobs()):
+            if record.get("creator") != cid:
                 continue
-            source = next((Path(c["src"]) for c in reversed(job.get("clips", []))
+            source = next((Path(c["src"]) for c in reversed(record.get("clips", []))
                            if c.get("src") and Path(c["src"]).is_file()), None)
             if source is not None:
                 break
     if source is None:
         raise HTTPException(404, "No recorded frame yet. Record the streamer or make a clip first.")
+
+    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{seek:.2f}", "-i", str(source),
+           "-frames:v", "1"]
+    if portrait:
+        region = selected or creator
+        layout = region.get("layout") or creator.get("layout") or "blur"
+        try:
+            width = (found or {}).get("width")
+            height = (found or {}).get("height")
+            if not width or not height:
+                meta = media.probe(source)
+                width, height = meta["width"], meta["height"]
+            if layout == "facecam_top" and (region.get("facecam_box") or creator.get("facecam_box")):
+                from . import facecam
+                filt = facecam.stacked_filter(
+                    width, height, region.get("facecam_box") or creator["facecam_box"],
+                    region.get("gameplay_box") or creator.get("gameplay_box"),
+                    out_width=360, out_height=640, fps=12,
+                )
+                cmd += ["-filter_complex", filt, "-map", "[v0]"]
+            elif layout in ("blur", "zoom"):
+                selected_layout, foreground, _, _ = render.geometry(width, height, layout)
+                fg = max(2, round(foreground * 640 / render.H))
+                filt = (
+                    "[0:v]split=2[a][b];"
+                    "[a]scale=90:160:force_original_aspect_ratio=increase,crop=90:160,"
+                    "boxblur=6:2,scale=360:640,eq=brightness=-0.14:saturation=1.15[bg];"
+                    f"[b]scale=360:{fg}:force_original_aspect_ratio=increase,crop=360:{fg}[fg];"
+                    "[bg][fg]overlay=0:(H-h)/2,setsar=1[v0];"
+                )
+                cmd += ["-filter_complex", filt, "-map", "[v0]"]
+            else:
+                cmd += ["-vf", "scale=360:640:force_original_aspect_ratio=increase,"
+                        "crop=360:640,setsar=1"]
+        except (ValueError, KeyError, RuntimeError, OSError):
+            raise HTTPException(503, "Could not create a vertical layout preview.")
+    else:
+        cmd += ["-vf", "scale=960:-2:flags=fast_bilinear"]
+    cmd += ["-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "5", "pipe:1"]
     try:
-        proc = subprocess.run(
-            ["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{seek:.2f}", "-i", str(source),
-             "-frames:v", "1", "-vf", "scale=960:-2:flags=fast_bilinear",
-             "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "5", "pipe:1"],
-            capture_output=True, timeout=12, creationflags=media.NO_WINDOW,
-        )
+        proc = subprocess.run(cmd, capture_output=True, timeout=12, creationflags=media.NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired):
         raise HTTPException(503, "Could not create a stream preview right now.")
     if proc.returncode or not proc.stdout:
         raise HTTPException(503, "Could not read the recorded stream frame.")
-    return Response(content=proc.stdout, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
+    return Response(content=proc.stdout, media_type="image/jpeg",
+                    headers={"Cache-Control": "private, no-store"})
 
 
 @app.get("/api/creators")
