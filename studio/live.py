@@ -198,7 +198,7 @@ class Session:
                 self.seg_clock = max(self.seg_clock, self.part_starts[self.part])
                 current_part = self.part
             p = f"p{current_part:02d}"
-            cmd = ["ffmpeg", "-v", "error", "-reconnect", "1", "-reconnect_streamed", "1",
+            cmd = ["ffmpeg", "-nostdin", "-v", "error", "-reconnect", "1", "-reconnect_streamed", "1",
                    "-reconnect_delay_max", "10"]
             for u in info["urls"]:
                 cmd += ["-i", u]
@@ -265,6 +265,8 @@ class Session:
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
                     self.proc.wait(timeout=5)
+                # FFmpeg may finalize the last CSV row on clean shutdown.
+                self._scan_segments()
             if self.stop_flag.is_set():
                 break
             if restarted_for_video:
