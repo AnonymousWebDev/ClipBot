@@ -11,7 +11,7 @@ import traceback
 import uuid
 from pathlib import Path
 
-from . import brain, config, creators, ctx, load, media, render, roman, safe, transcribe, usage
+from . import brain, config, creators, ctx, layout_check, load, media, render, roman, safe, transcribe, usage
 
 class _FairQueue:
     """Whose video is next. Each person has their own line and the lines take turns, so someone who adds ten
@@ -365,6 +365,16 @@ def request_render(jid, cid, changes: dict):
         new["style"] = DEFAULTS["style"]
     if new.get("layout") not in render.LAYOUTS:
         new["layout"] = DEFAULTS["layout"]
+    if new.get("layout") == "facecam_top" or clip.get("signal") is not None or clip.get("requires_layout_review") or clip.get("layout_check"):
+        # Recheck the newest saved calibration when the user remakes a held clip.
+        preset = creators.get(job.get("creator")) if job.get("creator") else None
+        if preset and new.get("layout") == "facecam_top":
+            new.update(facecam_box=preset.get("facecam_box"),
+                       gameplay_box=preset.get("gameplay_box"),
+                       facecam_version=preset.get("facecam_version", 0))
+        new["manual_layout_override"] = changes.get("manual_layout_override") is True
+        new["requires_layout_review"] = True
+        new.pop("layout_check", None)
     clip.update(new, status="queued")
     save(job)
     _q.put(("clip", jid, cid))
@@ -388,6 +398,23 @@ def render_one(job, clip, words):
             if preset:
                 local["facecam_box"] = preset.get("facecam_box")
                 local["gameplay_box"] = preset.get("gameplay_box")
+        if local.get("layout") == "facecam_top" or clip.get("signal") is not None or clip.get("requires_layout_review") or clip.get("layout_check"):
+            # Chat-generated clips are never rendered/published automatically if the
+            # webcam preset is missing or face detection cannot verify the crop.
+            if clip.get("manual_layout_override") and local.get("layout") == "facecam_top" and local.get("facecam_box"):
+                outcome = {"status": "manual", "reason": "Layout explicitly approved for rendering by a user.",
+                           "faces_found": 0, "samples": 0}
+            else:
+                outcome = layout_check.inspect(
+                    src, max(0.0, local["start"]), local["end"], local.get("facecam_box"),
+                    layout=local.get("layout"), source_width=job["width"], source_height=job["height"],
+                )
+            clip["layout_check"] = outcome
+            clip["requires_layout_review"] = outcome["status"] == "review"
+            if outcome["status"] == "review":
+                clip.update(status="layout_review", error=None)
+                save(job)
+                return
         near = _caption_words(job, clip, words, off) if clip.get("captions", True) else []
         out = render.render_clip(src, d / "clips", clip["id"], local, near, job["width"], job["height"])
         clip.update(out, status="done", version=clip.get("version", 0) + 1, error=None)

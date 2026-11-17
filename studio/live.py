@@ -599,7 +599,13 @@ class Session:
         end = self.samples / SR
         if end < 5:
             raise ValueError("Nothing has been recorded yet.")
-        self.manual.append({"start": max(0.0, end - seconds), "end": end})
+        request = {"start": max(0.0, end - seconds), "end": end}
+        if self.chat_mode:
+            # No transcript or AI describe() call exists in low-CPU mode.
+            request.update(score=0, category="manual", hook="", title="Manual highlight",
+                           description="", hashtags=[], highlight_words=[],
+                           reason="Clipped by hand", requires_layout_review=True)
+        self.manual.append(request)
 
     def _publish(self):
         elapsed = self.samples / SR

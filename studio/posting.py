@@ -65,6 +65,8 @@ def _next_slot(account_id, gap_min, cap):
 
 
 def enqueue(job, clip, account_ids, now=False) -> list:
+    if clip.get("requires_layout_review") or clip.get("status") != "done":
+        raise ValueError("This clip needs webcam review or has not finished rendering.")
     c = creators.get(job["creator"]) or creators.DEFAULTS
     made = []
     with _lock:
@@ -91,8 +93,8 @@ def enqueue(job, clip, account_ids, now=False) -> list:
 def on_clip_ready(job, clip):
     """Called once when a clip first finishes rendering."""
     # Chat-only clips need facecam layout validation before unattended posting.
-    if clip.get("requires_layout_review"):
-        return
+    if clip.get("requires_layout_review") or (clip.get("layout_check") or {}).get("status") == "manual":
+        return  # manually approved clips only post after the user explicitly requests it
     c = creators.get(job["creator"])
     if not c or not c["autopost"] or not c["accounts"]:
         return
@@ -113,8 +115,8 @@ def _post(p):
     clip = next((c for c in job["clips"] if c["id"] == p["clip"]), None) if job else None
     acc = accounts.get(p["account"])
     try:
-        if not clip or clip.get("status") != "done":
-            raise RuntimeError("The clip no longer exists or is not finished.")
+        if not clip or clip.get("status") != "done" or clip.get("requires_layout_review"):
+            raise RuntimeError("The clip no longer exists, is unfinished, or requires webcam review.")
         if not acc:
             raise RuntimeError("That account was disconnected.")
         path = Path(job["dir"]) / "clips" / clip["file"]

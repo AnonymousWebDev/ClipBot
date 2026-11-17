@@ -1374,11 +1374,12 @@ function setTab(t) {
   if (t === "setup") drawCreatorForm();
   if (t === "layout") {
     const cid = creatorId();
+    const sourceClip = S.layoutOrigin || null; S.layoutOrigin = null;
     window.ClipBotLayout.mount($("#layoutedit"), creator(), async body => {
       await send("/api/creators/" + encodeURIComponent(cid), body, "PUT");
       await tick();
       toast("Facecam layout saved", "ok");
-    });
+    }, sourceClip);
   }
   render();
 }
@@ -1706,6 +1707,7 @@ function postPills(c) {
 function clipHtml(j, c) {
   const m = `/media/${j.id}/`, a = `data-j="${j.id}" data-c="${esc(c.id)}"`;
   const body = c.status === "done" ? `<img src="${m}${esc(c.cover)}?v=${c.version}" alt="" loading="lazy"><span class="veil"><span>${ic("play")}</span></span>`
+    : c.status === "layout_review" ? `<span class="making" style="animation:none">Webcam check: review needed</span>`
     : c.status === "error" ? `<span class="making" style="animation:none;color:var(--bad);background:var(--bad-soft)">Could not make this clip. Open it to try again.</span>`
     : `<span class="making">${c.status === "rendering" ? "Making this clip…" : "Waiting its turn…"}</span>`;
   const key = `c:${j.id}:${c.id}`, busyClip = c.status === "queued" || c.status === "rendering";
@@ -2162,6 +2164,7 @@ function drawClipDlg(full) {
   if (!c) { if (dlg.open) dlg.close(); return; }
   const m = `/media/${j.id}/`, sig = c.status + c.version;
   const stage = c.status === "done" ? `<video src="${m}${esc(c.file)}?v=${c.version}" poster="${m}${esc(c.cover)}?v=${c.version}" controls autoplay playsinline></video>`
+    : c.status === "layout_review" ? `<div class="err" style="padding:20px;text-align:center">Webcam review needed: ${esc(c.layout_check?.reason || "Adjust the webcam region, then try again.")}</div>`
     : c.status === "error" ? `<div class="err" style="padding:20px;text-align:center">${esc(c.error || "Could not make this clip.")}</div>`
     : `<span class="making">${c.status === "rendering" ? "Making this clip…" : "Waiting its turn…"}</span>`;
   if (full) {
@@ -2169,7 +2172,9 @@ function drawClipDlg(full) {
       <div class="panel">
         <div class="job-head" style="margin:0"><div><span class="badge ${scoreCls(c.score)}" style="position:static">${c.judges ? "Words " + c.judges.words + (c.judges.reaction ? " · Reaction " + c.judges.reaction : "") : c.score ? "Score " + c.score : "Clipped by hand"}</span>
           <p class="sub" style="margin-top:8px">${esc(c.reason || "")}</p></div><button class="btn icon ghost" data-act="closedlg" aria-label="Close">${ic("x")}</button></div>
-        ${c.requires_layout_review ? `<p class="help">Automatic posting is disabled for this clip until webcam position validation is added. Review the webcam and regenerate the clip before posting.</p><button class="btn sm" data-act="layoutfromclip" data-j="${j.id}">Open webcam editor</button>` : ""}
+        ${c.requires_layout_review ? `<p class="help">Automatic webcam check: ${esc(c.layout_check?.reason || "Not checked yet.")} This clip will not auto-post until verified.</p>
+          <button class="btn sm" data-act="layoutfromclip" data-j="${j.id}" data-c="${c.id}">Open webcam editor</button>` : ""}
+        ${c.layout_check?.status === "verified" ? `<p class="help">Webcam check passed (${c.layout_check.faces_found}/${c.layout_check.samples} frames).</p>` : ""}
         <h3>On the video</h3>
         <label class="f">Big text<input data-f="hook" value="${esc(c.hook)}"></label>
         <label class="sw"><input type="checkbox" data-f="captions" data-caption-toggle ${c.captions === false ? "" : "checked"}>Generate captions</label>
@@ -2180,10 +2185,12 @@ function drawClipDlg(full) {
         <h3>Post text</h3>
         <label class="f">Title<input data-f="title" value="${esc(c.title)}"></label>
         <label class="f">Description<textarea data-f="description" rows="2">${esc(c.description)}</textarea></label>
+        ${c.requires_layout_review ? `<label class="sw"><input data-f="manual_layout_override" type="checkbox">I reviewed the webcam crop and approve rendering even if detection is unsure</label>` : ""}
         <button class="btn" data-act="remake">${ic("scissors")}Save and re-make clip</button>
+        ${c.status === "layout_review" ? `<button class="btn sm" data-act="layoutrecheck" data-j="${j.id}" data-c="${c.id}">Use saved webcam selection &amp; recheck</button>` : ""}
         <h3>Post it</h3>
         <div id="dposts" class="row" style="gap:4px"></div>
-        ${S.accounts.length ? `<div class="row">${S.accounts.map(a => `<label class="ck"><input type="checkbox" data-pacc value="${esc(a.id)}">${esc(a.label)} · ${esc(a.name)}</label>`).join("")}</div>
+        ${c.status !== "done" ? `<p class="help">Finish the webcam check and render this clip before posting.</p>` : S.accounts.length ? `<div class="row">${S.accounts.map(a => `<label class="ck"><input type="checkbox" data-pacc value="${esc(a.id)}">${esc(a.label)} · ${esc(a.name)}</label>`).join("")}</div>
           <div class="row"><button class="btn primary" data-act="postnow">${ic("send")}Post now</button><button class="btn" data-act="postqueue">Add to queue</button></div>`
           : `<p class="help">No accounts connected yet. Connect one in Settings.</p>`}
         <div class="row" style="margin-top:auto;padding-top:8px;border-top:1px solid var(--line)">
@@ -2329,7 +2336,11 @@ document.addEventListener("click", async e => {
     if (a === "addmore") { const u = $("#url"); return u && !u.value ? (u.focus(), toast("Paste another link, or drop a file anywhere on the box.")) : $("#file").click(); }
     if (a === "closedlg") return $("#clipdlg").close();
     if (a === "openclip") return openClip(d.j, d.c);
-    if (a === "layoutfromclip") { const j = jobOf(d.j); $("#clipdlg").close(); if (j?.creator) return go("c:" + j.creator, "layout"); return; }
+    if (a === "layoutfromclip") { const j = jobOf(d.j); $("#clipdlg").close(); if (j?.creator) { S.layoutOrigin = {job:d.j, clip:d.c || D.cid}; return go("c:" + j.creator, "layout"); } return; }
+    if (a === "layoutrecheck") {
+      await send(`/api/jobs/${d.j}/clips/${d.c}/render`, {layout:"facecam_top"});
+      toast("Checking the saved webcam layout…", "ok"); return tick();
+    }
     if (a === "newcreator") {
       const dlg = $("#formdlg");
       dlg.innerHTML = `<form method="dialog" class="dlg"><h2>New creator</h2><p class="help">Each creator gets their own workspace, folder, settings and accounts.</p>
