@@ -7,7 +7,7 @@
     x:Number(b.x), y:Number(b.y), w:Number(b.w), h:Number(b.h)
   } : null;
 
-  function mount(container, creator, onSave) {
+  function mount(container, creator, onSave, selectedClip = null) {
     if (!container) return;
     const values = {facecam:copyBox(creator.facecam_box), gameplay:copyBox(creator.gameplay_box)};
     let mode = "facecam", imageLoaded = false, action = null;
@@ -148,7 +148,9 @@
       message.textContent = "Loading a recorded frame…";
       img.style.visibility = "hidden";
       img.src = "/api/creators/" + encodeURIComponent(creator.id) +
-        "/layout/frame?fresh=" + Date.now();
+        "/layout/frame?fresh=" + Date.now() +
+        (selectedClip ? "&job=" + encodeURIComponent(selectedClip.job) +
+          "&clip=" + encodeURIComponent(selectedClip.clip) : "");
     }
     img.onload = () => {
       imageLoaded = true;
