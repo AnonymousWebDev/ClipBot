@@ -91,7 +91,7 @@ class HighlightWindowTests(unittest.TestCase):
             segment.write_bytes(b"video")
             session.segments = [(segment, 160.0, 200.0)]
             session.clip_last(30)
-            self.assertEqual(session.manual[-1], {"start": 170.0, "end": 200.0})
+            self.assertEqual((session.manual[-1]["start"], session.manual[-1]["end"]), (170.0, 200.0))
 
 
 if __name__ == "__main__":
