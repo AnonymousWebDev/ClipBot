@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import alerts, auth, brain, chat_highlights, config, creators, ctx, jobs, load, media, transcribe, usage
+from . import alerts, auth, brain, chat_highlights, config, creators, ctx, jobs, load, media, rolling_buffer, transcribe, usage
 
 SESSIONS: dict = {}
 SEG_SEC = 6           # length of each buffer piece
@@ -242,18 +242,7 @@ class Session:
                     self.seg_clock += dur
                 self.csv_seen[i] = len(rows)
             keep_from = self.seg_clock - self.settings["buffer_min"] * 60
-            # A queued render may wait several minutes on a slower PC. Retain every
-            # segment overlapping its requested range, even beyond the rolling window.
-            # Remove individually so a pinned old clip never holds unrelated segments.
-            retained = []
-            for segment in self.segments:
-                path, start, end = segment
-                needed = any(end > lo and start < hi for lo, hi in self.pinned.values())
-                if end < keep_from and not needed:
-                    path.unlink(missing_ok=True)
-                else:
-                    retained.append(segment)
-            self.segments = retained
+            self.segments = rolling_buffer.prune(self.segments, keep_from, self.pinned)
 
     # ---------------------------------------------------------------- chat (Twitch only)
     def _chat(self, channel):
