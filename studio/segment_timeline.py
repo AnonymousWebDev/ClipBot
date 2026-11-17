@@ -8,15 +8,32 @@ import math
 from pathlib import Path
 
 
+# The 720p Twitch recorder normally writes ~6s files. A media timestamp
+# discontinuity can turn one file into a multi-minute monster. Never mistake
+# its CSV duration for usable clip footage.
+NOMINAL_SEGMENT_SEC = 6.0
+MAX_SEGMENT_SEC = 18.0
+MAX_SEGMENT_BYTES = 40 * 1024 * 1024
+
+
 def index_rows(rows, seen, base, origin, folder):
     """Return (new_segments, new_seen, first_timestamp).
 
-    Only consume valid, complete, nonempty files in sequence. A partially
-    written CSV row must be retried during the next scan.
+    CSV timestamps are usually consecutive, but Twitch HLS can jump abruptly
+    backwards or forwards mid-recording. Rebuild a local monotonic timeline
+    from each completed file's *bounded* duration. An anomalous file consumes
+    one nominal segment of timeline but is excluded, leaving an honest gap in
+    the available footage. Earlier rows are replayed without checking pruned
+    files, so reconnects and rolling-buffer pruning remain safe.
+
+    Only consume an incomplete final CSV row when its TS file is fully written.
     """
     result = []
     offset = seen
-    for row in rows[seen:]:
+    previous_raw_end = None
+    local_end = 0.0
+    first = origin
+    for idx, row in enumerate(rows):
         fields = row.split(",")
         if len(fields) < 3:
             break
@@ -25,22 +42,54 @@ def index_rows(rows, seen, base, origin, folder):
             start, end = float(fields[1]), float(fields[2])
         except ValueError:
             break
-        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+        if not math.isfinite(start) or not math.isfinite(end):
             break
-        # FFmpeg is the only writer of the CSV, but still refuse paths outside
-        # our private segment folder or unexpected filenames.
+        # FFmpeg is the only writer of the CSV, but still refuse unsafe paths.
         if not name.startswith("p") or not name.endswith(".ts") or Path(name).name != name:
             break
         path = folder / name
-        if not path.is_file() or path.stat().st_size == 0:
-            break
-        if origin is None:
-            origin = start
-        local_start = max(0.0, start - origin)
-        local_end = max(local_start, end - origin)
-        result.append((path, base + local_start, base + local_end))
-        offset += 1
-    return result, offset, origin
+        size = None
+        if idx >= seen:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                break
+            if size == 0:
+                break
+        if first is None:
+            first = start
+        if idx == 0:
+            local_start = 0.0
+        elif previous_raw_end is None:
+            local_start = local_end
+        else:
+            gap = start - previous_raw_end
+            if -2.0 <= gap <= MAX_SEGMENT_SEC:
+                # Preserve normal CSV jitter and small genuine media gaps.
+                local_start = max(0.0, local_end + gap)
+            elif gap > MAX_SEGMENT_SEC:
+                # An unexpected forward jump is missing footage, not hours
+                # of video. Represent a bounded gap for clip-safety.
+                local_start = local_end + NOMINAL_SEGMENT_SEC
+            else:
+                # A backwards PTS jump is a new timestamp epoch.
+                local_start = local_end
+        duration = end - start
+        if not (0.0 < duration <= MAX_SEGMENT_SEC) or (
+            size is not None and size > MAX_SEGMENT_BYTES
+        ):
+            # Drop an impossible/overgrown segment; keep the gap. Do not allow
+            # one 8920-second timestamp to poison the whole recording clock.
+            local_end = local_start + NOMINAL_SEGMENT_SEC
+            previous_raw_end = None
+        else:
+            local_end = local_start + duration
+            previous_raw_end = end
+            if idx >= seen:
+                result.append((path, base + local_start, base + local_end))
+        if idx >= seen:
+            offset = idx + 1
+    return result, offset, first
 
 
 def latest_video_time(segments):
