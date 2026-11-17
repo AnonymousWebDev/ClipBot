@@ -16,6 +16,8 @@ jobs:
           python-version: '3.11'
       - name: Syntax check
         run: python -m compileall -q studio tests
+      - name: Install FFmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg
       - name: Chat and facecam unit tests
         run: python -m unittest tests.test_chat_highlights tests.test_facecam -v
       - name: Check dashboard JavaScript
