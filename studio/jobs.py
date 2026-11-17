@@ -774,6 +774,29 @@ def _run_job(job):
     creators.log(job["creator"], f"Video finished with {len(clips)} clips in {round(time.time() - t0)}s: {job['title']}")
 
 
+def _words_for_remake(job, clip):
+    """Read the saved transcript before re-making a clip.
+
+    Chat-only live recordings deliberately have no words.json. Missing words
+    must produce a useful error rather than strand a clip in "queued".
+    """
+    if not clip.get("captions", True):
+        return []
+    transcript = Path(job["dir"]) / "words.json"
+    if not transcript.is_file():
+        if job.get("kind") == "live":
+            raise ValueError("Captions are not available for this chat-only live clip. "
+                             "Turn off Generate captions, then save and re-make.")
+        raise ValueError("This video's transcript is missing. Re-process the original video before remaking.")
+    try:
+        words = json.loads(transcript.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("The saved transcript could not be read. Please re-process the source video.") from exc
+    if not isinstance(words, list):
+        raise ValueError("The saved transcript is invalid. Please re-process the source video.")
+    return words
+
+
 def _worker(quick_only=False):
     while True:
         kind, a, cid = _q.get(quick_only)
@@ -794,9 +817,7 @@ def _worker(quick_only=False):
                 _run_job(job)
             else:
                 clip = next(c for c in job["clips"] if c["id"] == cid)
-                words = []
-                if clip.get("captions", True):
-                    words = json.loads((Path(job["dir"]) / "words.json").read_text(encoding="utf-8"))
+                words = _words_for_remake(job, clip)
                 render_one(job, clip, words)
         except Exception as e:  # noqa: BLE001
             (Path(job["dir"]) / "error.log").write_text(traceback.format_exc(), encoding="utf-8")
@@ -806,6 +827,14 @@ def _worker(quick_only=False):
                         c.update(status="error", error="The video stopped before this clip was made.")
                 _set(job, status="error", error=safe.friendly(e), stage="Stopped")
                 creators.log(job["creator"], f"Video failed: {safe.friendly(e)[:200]}")
+            else:
+                # This includes failures *before* render_one marks it rendering
+                # (missing/corrupt transcript, source paths, unexpected errors).
+                # Never leave the UI stuck on "Preparing clip..." indefinitely.
+                clip = next((c for c in job.get("clips", []) if c.get("id") == cid), None)
+                if clip is not None:
+                    clip.update(status="error", error=safe.friendly(e, 400))
+                    save(job)
         finally:
             ctx._uid.reset(token)
             if kind == "job":
