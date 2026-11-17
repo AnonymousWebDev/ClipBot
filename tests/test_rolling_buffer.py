@@ -27,7 +27,7 @@ class RollingBufferTests(unittest.TestCase):
             after = prune(retained, keep_from=240.0, pinned={})
             self.assertFalse(entries[6][0].exists())
             self.assertTrue(entries[55][0].exists())
-            self.assertEqual(len(after), 20)
+            self.assertEqual(len(after), 21)  # keep boundary segment ending at 240s
 
     def test_overlapping_pins_and_boundary_touch_do_not_keep_extra_files(self):
         with tempfile.TemporaryDirectory() as root:
