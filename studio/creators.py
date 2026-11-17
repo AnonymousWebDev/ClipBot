@@ -6,7 +6,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import config, ctx
+from . import config, ctx, facecam
 
 
 def _root() -> Path:
@@ -15,7 +15,7 @@ def _root() -> Path:
 _lock = threading.RLock()
 
 DEFAULTS = {"name": "", "channel": "", "style": "bounce", "layout": "blur", "captions": True, "min_len": 15, "max_len": 60,
-            "max_clips": 6, "min_score": 80, "auto_watch": False, "buffer_min": 3, "highlight_mode": "chat", "live_per_hour": 4, "ai_every_min": 3, "ai_only_on_spike": True, "auto_jump_pct": 60,
+            "facecam_box": None, "gameplay_box": None, "max_clips": 6, "min_score": 80, "auto_watch": False, "buffer_min": 3, "highlight_mode": "chat", "live_per_hour": 4, "ai_every_min": 3, "ai_only_on_spike": True, "auto_jump_pct": 60,
             "plan": "free", "decide_mode": "both", "must_clip_min": 0, "min_gap_min": 2,
             "trigger_words": "clip that, clip it",
             "autopost": False, "accounts": [], "post_min_score": 75, "post_gap_min": 45, "daily_cap": 6,
@@ -35,6 +35,7 @@ def _fix(c: dict) -> dict:
     if c.get("channel") and platform_key(c["channel"]) and c["channel"] not in ch.values():
         ch.setdefault(platform_key(c["channel"]), c["channel"])
     c["channels"] = ch
+    c.setdefault("facecam_version", 0)
     if not c.get("ai_every_min"):
         c["ai_every_min"] = 3       # "Auto" (0) is gone: jumps in loudness and chat are now always checked
     if c.get("channel") not in ch.values():
@@ -59,10 +60,12 @@ def _clean(data: dict) -> dict:
                     raise ValueError("Captions must be on or off.")
                 out[k] = data[k]
             continue
-        if k not in data or data[k] is None:
+        if k not in data or (data[k] is None and k not in ("facecam_box", "gameplay_box")):
             continue
         v = data[k]
-        if k in NUMERIC:
+        if k in ("facecam_box", "gameplay_box"):
+            v = facecam.validate_box(v, optional=True)
+        elif k in NUMERIC:
             lo, hi = NUMERIC[k]
             v = max(lo, min(hi, int(float(v))))
         elif k in ("auto_watch", "autopost", "ai_only_on_spike"):
@@ -159,6 +162,8 @@ def update(cid, data: dict) -> dict:
     if "channel" in new and new["channel"] and "channels" not in new:
         new["channels"] = {**c["channels"], platform_key(new["channel"]): new["channel"]}
     c.update(new)
+    if "facecam_box" in new or "gameplay_box" in new:
+        c["facecam_version"] = int(c.get("facecam_version", 0)) + 1
     _fix(c)
     if c["min_len"] >= c["max_len"]:
         raise ValueError("Shortest clip must be shorter than longest clip.")
