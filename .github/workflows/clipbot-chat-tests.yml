@@ -16,5 +16,12 @@ jobs:
           python-version: '3.11'
       - name: Syntax check
         run: python -m compileall -q studio tests
-      - name: Chat highlight unit tests
-        run: python -m unittest tests.test_chat_highlights -v
+      - name: Install FFmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg
+      - name: Chat and facecam unit tests
+        run: python -m unittest tests.test_chat_highlights tests.test_facecam -v
+      - name: Check dashboard JavaScript
+        run: |
+          node --check web/clipbot-layout.js
+          python -c 'from pathlib import Path; t=Path("web/index.html").read_text(); Path("/tmp/clipbot-inline.js").write_text(t.split("<script>",1)[1].split("</script>",1)[0])'
+          node --check /tmp/clipbot-inline.js

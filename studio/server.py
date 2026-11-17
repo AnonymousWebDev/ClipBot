@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -1159,6 +1160,45 @@ def creator_avatar(cid: str, p: str = ""):
     if not f.is_file() or prof.get("pic") not in ("image/jpeg", "image/png", "image/webp"):
         raise HTTPException(404)
     return FileResponse(f, media_type=prof["pic"], headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.get("/api/creators/{cid}/layout/frame")
+def creator_layout_frame(cid: str):
+    """One real frame from the owner's recorded media for the webcam rectangle editor.
+
+    Never downloads a fresh stream or accepts an arbitrary filesystem path.
+    """
+    if not creators.get(cid):
+        raise HTTPException(404, "No such creator")
+    _throttle("layoutframe:" + ctx.uid(), 30, 60)
+    source = None
+    session = live.active_for(cid)
+    if session:
+        session._scan_segments()
+        with session.lock:
+            source = next((p for p, a, b in reversed(session.segments) if p.is_file()), None)
+    if source is None:
+        for job in reversed(jobs.list_jobs()):
+            if job.get("creator") != cid:
+                continue
+            source = next((Path(c["src"]) for c in reversed(job.get("clips", []))
+                           if c.get("src") and Path(c["src"]).is_file()), None)
+            if source is not None:
+                break
+    if source is None:
+        raise HTTPException(404, "No recorded frame yet. Record the streamer or make a clip first.")
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-ss", "1", "-i", str(source),
+             "-frames:v", "1", "-vf", "scale=960:-2:flags=fast_bilinear",
+             "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "5", "pipe:1"],
+            capture_output=True, timeout=12, creationflags=media.NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise HTTPException(503, "Could not create a stream preview right now.")
+    if proc.returncode or not proc.stdout:
+        raise HTTPException(503, "Could not read the recorded stream frame.")
+    return Response(content=proc.stdout, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
 
 
 @app.get("/api/creators")

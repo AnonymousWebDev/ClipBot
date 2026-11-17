@@ -522,6 +522,9 @@ class Session:
     def _add_clip(self, c):
         self.n += 1
         c.update(id=f"clip{self.n:03d}", style=self.settings["style"], layout=self.settings["layout"],
+                 facecam_box=self.settings.get("facecam_box"),
+                 gameplay_box=self.settings.get("gameplay_box"),
+                 facecam_version=self.settings.get("facecam_version", 0),
                  captions=False if self.chat_mode else self.job["options"].get("captions", True),
                  status="queued", version=0, made_at=time.time())
         with self.lock:
