@@ -375,6 +375,10 @@ def request_render(jid, cid, changes: dict):
         new["manual_layout_override"] = changes.get("manual_layout_override") is True
         new["requires_layout_review"] = True
         new.pop("layout_check", None)
+    if (new.get("captions", True) and job.get("kind") == "live"
+            and not (Path(job["dir"]) / "words.json").is_file()):
+        raise ValueError("This live recording has no transcript. "
+                         "Turn off Generate captions, then save and re-make.")
     clip.update(new, status="queued")
     save(job)
     _q.put(("clip", jid, cid))
