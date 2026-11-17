@@ -382,6 +382,12 @@ def render_one(job, clip, words):
         if not clip.get("src"):
             clip["end"] = min(clip["end"], job["duration"])
         local = dict(clip, start=clip["start"] - off, end=clip["end"] - off, hook=roman.to_roman(clip.get("hook") or ""))
+        if local.get("layout") == "facecam_top" and not local.get("facecam_box"):
+            # For re-renders after a new selection, use the current creator preset.
+            preset = creators.get(job.get("creator")) if job.get("creator") else None
+            if preset:
+                local["facecam_box"] = preset.get("facecam_box")
+                local["gameplay_box"] = preset.get("gameplay_box")
         near = _caption_words(job, clip, words, off) if clip.get("captions", True) else []
         out = render.render_clip(src, d / "clips", clip["id"], local, near, job["width"], job["height"])
         clip.update(out, status="done", version=clip.get("version", 0) + 1, error=None)
