@@ -7,8 +7,8 @@ import re
 from collections.abc import Mapping
 
 REACTIONS = re.compile(
-    r"\\b(?:kekw|omegalul|lulw?|lmao|lol|rofl|pog(?:gers|champ)?|"
-    r"wtf|holy|insane|no\\s+way|lets\\s+go)\\b", re.IGNORECASE
+    r"\b(?:kekw|omegalul|lulw?|lmao|lol|rofl|pog(?:gers|champ)?|"
+    r"wtf|holy|insane|no\s+way|lets\s+go)\b", re.IGNORECASE
 )
 
 
