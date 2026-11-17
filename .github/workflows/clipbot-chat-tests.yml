@@ -2,7 +2,7 @@ name: Clip Bot chat tests
 
 on:
   push:
-    branches: [clipbot-dev]
+    branches: [clipbot-dev, feature/layout-validation]
   pull_request:
     branches: [main]
 
@@ -18,8 +18,10 @@ jobs:
         run: python -m compileall -q studio tests
       - name: Install FFmpeg
         run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg
-      - name: Chat and facecam unit tests
-        run: python -m unittest tests.test_chat_highlights tests.test_facecam -v
+      - name: Install CPU face detector for validation tests
+        run: python -m pip install opencv-python-headless==4.12.0.88
+      - name: Chat, facecam and validation tests
+        run: python -m unittest tests.test_chat_highlights tests.test_facecam tests.test_layout_check -v
       - name: Check dashboard JavaScript
         run: |
           node --check web/clipbot-layout.js
