@@ -6,6 +6,7 @@ import math
 import queue
 import shutil
 import threading
+import tempfile
 import time
 import traceback
 import uuid
@@ -375,10 +376,6 @@ def request_render(jid, cid, changes: dict):
         new["manual_layout_override"] = changes.get("manual_layout_override") is True
         new["requires_layout_review"] = True
         new.pop("layout_check", None)
-    if (new.get("captions", True) and job.get("kind") == "live"
-            and not (Path(job["dir"]) / "words.json").is_file()):
-        raise ValueError("This live recording has no transcript. "
-                         "Turn off Generate captions, then save and re-make.")
     clip.update(new, status="queued")
     save(job)
     _q.put(("clip", jid, cid))
@@ -419,9 +416,23 @@ def render_one(job, clip, words):
                 clip.update(status="layout_review", error=None)
                 save(job)
                 return
-        near = _caption_words(job, clip, words, off) if clip.get("captions", True) else []
+        near = []
+        if clip.get("captions", True):
+            if job.get("kind") == "live" and (clip.get("speech_on_render")
+                    or (job.get("live") or {}).get("mode") == "chat" or not words):
+                # Chat-driven highlights are not transcribed during recording.
+                # Speech is recognized locally from the saved clip only, never
+                # by a paid AI service and never from the entire stream.
+                clip["render_stage"] = "Transcribing speech"
+                save(job)
+                near = _live_caption_words(job, clip, src, local["start"], local["end"])
+            else:
+                near = _caption_words(job, clip, words, off)
+        clip["render_stage"] = "Rendering video"
+        save(job)
         out = render.render_clip(src, d / "clips", clip["id"], local, near, job["width"], job["height"])
         clip.update(out, status="done", version=clip.get("version", 0) + 1, error=None)
+        clip.pop("render_stage", None)
         post = {k: clip[k] for k in ("title", "description", "hashtags", "hook", "start", "end", "score")}
         (d / "clips" / f"{clip['id']}.json").write_text(json.dumps(post, indent=1), encoding="utf-8")
         if clip["version"] == 1:
@@ -435,8 +446,40 @@ def render_one(job, clip, words):
                     traceback.print_exc()
     except Exception as e:  # noqa: BLE001
         clip.update(status="error", error=safe.friendly(e, 400))
+        clip.pop("render_stage", None)
         creators.log(job["creator"], f"Clip failed: {safe.friendly(e, 200)}")
     save(job)
+
+
+def _live_caption_words(job, clip, src, start, end):
+    """Transcribe just this saved live clip with the local speech model.
+
+    The transcript is cached in source-relative seconds so later facecam edits,
+    trims and re-renders do not run speech recognition again. No paid AI calls,
+    caption translation, or full-stream transcription are involved.
+    """
+    cache = Path(job["dir"]) / "clips" / f"{clip['id']}.speech.json"
+    stat = src.stat()
+    source_id = {"name": src.name, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    words = None
+    try:
+        saved = json.loads(cache.read_text(encoding="utf-8"))
+        if saved.get("source") == source_id and isinstance(saved.get("words"), list):
+            words = saved["words"]
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    if words is None:
+        # Temporary files go in a short system path to avoid the Windows
+        # 260-character FFmpeg filter/path restriction.
+        with tempfile.TemporaryDirectory(prefix="pk-speech-") as temp:
+            wav = Path(temp) / "speech.wav"
+            media.extract_audio(src, wav)
+            words = transcribe.transcribe(media.load_audio(wav))
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"source": source_id, "words": words}), encoding="utf-8")
+        tmp.replace(cache)
+    return [dict(w) for w in roman.words(words) if start - 0.05 <= w["s"] < end]
 
 
 def _caption_words(job, clip, words, off):
@@ -789,8 +832,7 @@ def _words_for_remake(job, clip):
     transcript = Path(job["dir"]) / "words.json"
     if not transcript.is_file():
         if job.get("kind") == "live":
-            raise ValueError("Captions are not available for this chat-only live clip. "
-                             "Turn off Generate captions, then save and re-make.")
+            return []  # speech comes from the saved clip during render_one()
         raise ValueError("This video's transcript is missing. Re-process the original video before remaking.")
     try:
         words = json.loads(transcript.read_text(encoding="utf-8"))
