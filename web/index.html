@@ -829,6 +829,12 @@ dialog[open]{animation:fadein .16s ease}
 .cb-preview{display:block;width:min(100%,245px);height:auto;aspect-ratio:9/16;margin:0 auto;border-radius:9px;background:#111}
 .cb-footer{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-top:18px;border-top:1px solid var(--line);padding-top:14px}
 @media(max-width:760px){.cb-grid{grid-template-columns:1fr}.cb-footer{flex-direction:column;align-items:flex-start}}
+
+/* Static preview while the CPU-bound render worker is busy */
+.clip-frame-preview{width:100%;height:100%;min-height:320px;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.clip-frame-preview img{width:auto!important;max-width:100%;max-height:calc(100vh - 125px)!important;object-fit:contain;aspect-ratio:9/16}
+.clip-frame-preview span{color:#fff;font-size:11px;padding:5px 8px;opacity:.9}
+.clip-preview-note{position:absolute;bottom:0;left:0;right:0;padding:10px;background:rgba(20,17,14,.82);color:#fff;font-size:12px;text-align:center;line-height:1.4}
 </style>
 </head>
 <body>
@@ -1706,10 +1712,11 @@ function postPills(c) {
 }
 function clipHtml(j, c) {
   const m = `/media/${j.id}/`, a = `data-j="${j.id}" data-c="${esc(c.id)}"`;
+  const preview = j.creator ? `<img src="/api/creators/${encodeURIComponent(j.creator)}/layout/frame?job=${encodeURIComponent(j.id)}&clip=${encodeURIComponent(c.id)}&portrait=1" alt="Approximate vertical frame preview" loading="lazy">` : "";
   const body = c.status === "done" ? `<img src="${m}${esc(c.cover)}?v=${c.version}" alt="" loading="lazy"><span class="veil"><span>${ic("play")}</span></span>`
-    : c.status === "layout_review" ? `<span class="making" style="animation:none">Webcam check: review needed</span>`
+    : c.status === "layout_review" ? `${preview}<span class="making" style="animation:none;background:rgba(255,255,255,.75)">Webcam check: review needed</span>`
     : c.status === "error" ? `<span class="making" style="animation:none;color:var(--bad);background:var(--bad-soft)">Could not make this clip. Open it to try again.</span>`
-    : `<span class="making">${c.status === "rendering" ? "Making this clip…" : "Waiting its turn…"}</span>`;
+    : `${preview}<span class="making" style="background:rgba(255,255,255,.75)">${c.status === "rendering" ? "Rendering…" : c.buffer_pinned ? "Queued · footage protected" : "Preparing clip…"}</span>`;
   const key = `c:${j.id}:${c.id}`, busyClip = c.status === "queued" || c.status === "rendering";
   return `<article class="clip ${sel().has(key) ? "picked" : ""}">
     <button class="shot" data-act="openclip" ${a} aria-label="Open clip: ${esc(c.title || c.hook)}">${body}
@@ -1739,6 +1746,7 @@ function everyPick(cid, v) {
 }
 function liveHtml(j) {
   const L = j.live || {elapsed:0, lines:[], level:[], chat:null, checks:0, buffer_sec:0, pending_clips:0};
+  const chatMode = L.mode === "chat";
   return `<div class="livecard">
     <div class="lc-head"><div class="lc-title"><span class="pill live"><span class="dot"></span>Live</span>
         <h3>${esc(j.title || j.source.name)}</h3><p class="sub">${esc(j.uploader)}${j.uploader ? " · " : ""}${esc(j.stage)}</p></div>
@@ -1746,14 +1754,14 @@ function liveHtml(j) {
         <button class="btn" data-act="clipnow" data-j="${j.id}" data-s="60">Last 60s</button>
         <button class="btn danger" data-act="stoplive" data-j="${j.id}">${ic("stop")}Stop</button></div></div>
     <div class="stats"><div class="stat"><b>${fmt(L.elapsed)}</b><span>Recorded</span></div><div class="stat"><b>${Math.round(L.buffer_sec / 60)} min</b><span>Kept in buffer</span></div>
-      <div class="stat">${everyPick(j.creator, L.every_min ?? 3)}<span>${L.every_min === 0 ? (L.auto?.warming ? "AI checks: learning the stream" : L.auto?.waiting ? "AI checks: jump spotted, checking soon" : `AI checks on jumps · ${L.auto?.spikes || 0} so far`) : "AI checks every"}</span></div>
-      <div class="stat"><b>${L.checks}</b><span>AI calls${L.skipped ? ` · ${L.skipped} skipped` : ""}${L.rejected ? ` · ${L.rejected} turned down` : ""}</span></div><div class="stat"><b>${j.clips.length}</b><span>Clips so far</span></div>
+      <div class="stat">${chatMode ? `<b>${L.chat_spikes || 0}</b><span>Chat spikes detected</span>` : `${everyPick(j.creator, L.every_min ?? 3)}<span>AI checks every</span>`}</div>
+      <div class="stat"><b>${chatMode ? (L.chat_connected ? "Connected" : "Connecting") : L.checks}</b><span>${chatMode ? "Twitch chat monitor · no AI" : `AI calls${L.skipped ? " · " + L.skipped + " skipped" : ""}`}</span></div><div class="stat"><b>${j.clips.length}</b><span>Clips so far</span></div>
       ${L.pending_clips ? `<div class="stat"><b>${L.pending_clips}</b><span>Hand clip being prepared</span></div>` : ""}</div>
     <div class="meters">
       <div class="meter"><h4>Loudness, last minute</h4>${spark(L.level, "", -55, -8)}</div>
       ${L.chat ? `<div class="meter"><h4>Chat messages per second</h4>${spark(L.chat, "chat", 0, Math.max(4, ...L.chat))}</div>` : ""}
-      <div class="meter"><h4>Latest AI decisions</h4><div class="said" style="justify-content:flex-start;color:var(--text)">${(L.verdicts || []).length ? L.verdicts.slice(0, 4).map(v => `<div>${fmt(v.t)} · ${v.transcript != null ? "words " + v.transcript : ""}${v.reaction != null ? " · reaction " + v.reaction : ""} · <span class="sub">${esc(v.result)}</span></div>`).join("") : "<div class='sub'>First check soon…</div>"}</div></div>
-      <div class="meter"><h4>What was just said</h4><div class="said">${L.lines.length ? L.lines.map(t => `<div>${esc(t)}</div>`).join("") : "<div>Listening…</div>"}</div></div>
+      <div class="meter"><h4>${chatMode ? "Chat-spike status" : "Latest AI decisions"}</h4><div class="said" style="justify-content:flex-start;color:var(--text)">${chatMode ? `<div class="sub">${L.chat_connected ? "Monitoring chat activity" : "Waiting for Twitch chat connection"} · ${L.chat_spikes || 0} spikes</div>` : (L.verdicts || []).length ? L.verdicts.slice(0, 4).map(v => `<div>${fmt(v.t)} · ${v.transcript != null ? "words " + v.transcript : ""}${v.reaction != null ? " · reaction " + v.reaction : ""} · <span class="sub">${esc(v.result)}</span></div>`).join("") : "<div class='sub'>First check soon…</div>"}</div></div>
+      <div class="meter"><h4>${chatMode ? "Transcription" : "What was just said"}</h4><div class="said">${chatMode ? "<div class='sub'>Off in chat-only mode to save CPU. Chat messages are monitored instead.</div>" : L.lines.length ? L.lines.map(t => `<div>${esc(t)}</div>`).join("") : "<div>Listening…</div>"}</div></div>
     </div>${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}</div>
     ${j.clips.length ? `<div class="grid" style="margin-bottom:28px">${[...j.clips].reverse().map(c => clipHtml(j, c)).join("")}</div>` : ""}`;
 }
@@ -2163,10 +2171,11 @@ function drawClipDlg(full) {
   const j = jobOf(D.jid), c = j?.clips.find(x => x.id === D.cid), dlg = $("#clipdlg");
   if (!c) { if (dlg.open) dlg.close(); return; }
   const m = `/media/${j.id}/`, sig = c.status + c.version;
+  const preview = j.creator ? `<div class="clip-frame-preview"><img src="/api/creators/${encodeURIComponent(j.creator)}/layout/frame?job=${encodeURIComponent(j.id)}&clip=${encodeURIComponent(c.id)}&portrait=1" alt="Approximate 9:16 preview from the source stream"><span>Frame preview · final clip may include captions</span></div>` : "";
   const stage = c.status === "done" ? `<video src="${m}${esc(c.file)}?v=${c.version}" poster="${m}${esc(c.cover)}?v=${c.version}" controls autoplay playsinline></video>`
-    : c.status === "layout_review" ? `<div class="err" style="padding:20px;text-align:center">Webcam review needed: ${esc(c.layout_check?.reason || "Adjust the webcam region, then try again.")}</div>`
+    : c.status === "layout_review" ? `${preview}<div class="clip-preview-note">Webcam review needed: ${esc(c.layout_check?.reason || "Adjust the webcam region, then try again.")}</div>`
     : c.status === "error" ? `<div class="err" style="padding:20px;text-align:center">${esc(c.error || "Could not make this clip.")}</div>`
-    : `<span class="making">${c.status === "rendering" ? "Making this clip…" : "Waiting its turn…"}</span>`;
+    : `${preview}<div class="clip-preview-note">${c.status === "rendering" ? "Rendering video…" : c.buffer_pinned ? "Queued · original footage protected while waiting" : "Preparing video…"}</div>`;
   if (full) {
     dlg.innerHTML = `<div class="editor"><div class="stage" id="stage">${stage}</div>
       <div class="panel">
