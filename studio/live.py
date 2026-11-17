@@ -655,6 +655,10 @@ class Session:
                       "rejected": self.rejected, "verdicts": list(reversed(self.verdicts)),
                       "every_min": int(self.settings.get("ai_every_min", 3)) or 3,
                       "auto": None,
+                      "mode": "chat" if self.chat_mode else "ai",
+                      "chat_connected": self.chat_on,
+                      "chat_spikes": self.spikes,
+                      "chat_baseline": self.base,
                       "pending_clips": len(self.manual)})
         jobs.save(self.job)
 
