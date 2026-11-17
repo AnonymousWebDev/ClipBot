@@ -365,7 +365,7 @@ def request_render(jid, cid, changes: dict):
         new["style"] = DEFAULTS["style"]
     if new.get("layout") not in render.LAYOUTS:
         new["layout"] = DEFAULTS["layout"]
-    if clip.get("signal") is not None or clip.get("requires_layout_review") or clip.get("layout_check"):
+    if new.get("layout") == "facecam_top" or clip.get("signal") is not None or clip.get("requires_layout_review") or clip.get("layout_check"):
         # Recheck the newest saved calibration when the user remakes a held clip.
         preset = creators.get(job.get("creator")) if job.get("creator") else None
         if preset and new.get("layout") == "facecam_top":
@@ -398,7 +398,7 @@ def render_one(job, clip, words):
             if preset:
                 local["facecam_box"] = preset.get("facecam_box")
                 local["gameplay_box"] = preset.get("gameplay_box")
-        if clip.get("signal") is not None or clip.get("requires_layout_review") or clip.get("layout_check"):
+        if local.get("layout") == "facecam_top" or clip.get("signal") is not None or clip.get("requires_layout_review") or clip.get("layout_check"):
             # Chat-generated clips are never rendered/published automatically if the
             # webcam preset is missing or face detection cannot verify the crop.
             if clip.get("manual_layout_override") and local.get("layout") == "facecam_top" and local.get("facecam_box"):
