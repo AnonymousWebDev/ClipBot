@@ -2,7 +2,7 @@ name: Clip Bot chat tests
 
 on:
   push:
-    branches: [clipbot-dev, feature/layout-validation, fix/windows-live-clip-buffer]
+    branches: [clipbot-dev, feature/layout-validation, fix/windows-live-clip-buffer, fix/live-video-clock]
   pull_request:
     branches: [main]
 
@@ -21,7 +21,7 @@ jobs:
       - name: Install CPU face detector for validation tests
         run: python -m pip install opencv-python-headless==4.12.0.88
       - name: Chat, facecam and validation tests
-        run: python -m unittest tests.test_chat_highlights tests.test_facecam tests.test_layout_check tests.test_rolling_buffer -v
+        run: python -m unittest tests.test_chat_highlights tests.test_facecam tests.test_layout_check tests.test_rolling_buffer tests.test_segment_timeline -v
       - name: Check dashboard JavaScript
         run: |
           node --check web/clipbot-layout.js
