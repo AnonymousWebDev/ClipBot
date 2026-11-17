@@ -1716,7 +1716,7 @@ function clipHtml(j, c) {
   const body = c.status === "done" ? `<img src="${m}${esc(c.cover)}?v=${c.version}" alt="" loading="lazy"><span class="veil"><span>${ic("play")}</span></span>`
     : c.status === "layout_review" ? `${preview}<span class="making" style="animation:none;background:rgba(255,255,255,.75)">Webcam check: review needed</span>`
     : c.status === "error" ? `<span class="making" style="animation:none;color:var(--bad);background:var(--bad-soft)">Could not make this clip. Open it to try again.</span>`
-    : `${preview}<span class="making" style="background:rgba(255,255,255,.75)">${c.status === "rendering" ? "Rendering…" : c.buffer_pinned ? "Queued · footage protected" : "Preparing clip…"}</span>`;
+    : `${preview}<span class="making" style="background:rgba(255,255,255,.75)">${c.status === "rendering" ? esc(c.render_stage || "Rendering…") + "…" : c.buffer_pinned ? "Queued · footage protected" : "Preparing clip…"}</span>`;
   const key = `c:${j.id}:${c.id}`, busyClip = c.status === "queued" || c.status === "rendering";
   return `<article class="clip ${sel().has(key) ? "picked" : ""}">
     <button class="shot" data-act="openclip" ${a} aria-label="Open clip: ${esc(c.title || c.hook)}">${body}
@@ -2183,7 +2183,7 @@ function drawClipDlg(full) {
   const stage = c.status === "done" ? `<video src="${m}${esc(c.file)}?v=${c.version}" poster="${m}${esc(c.cover)}?v=${c.version}" controls autoplay playsinline></video>`
     : c.status === "layout_review" ? `${preview}<div class="clip-preview-note">Webcam review needed: ${esc(c.layout_check?.reason || "Adjust the webcam region, then try again.")}</div>`
     : c.status === "error" ? `<div class="err" style="padding:20px;text-align:center">${esc(c.error || "Could not make this clip.")}</div>`
-    : `${preview}<div class="clip-preview-note">${c.status === "rendering" ? "Rendering video…" : c.buffer_pinned ? "Queued · original footage protected while waiting" : "Preparing video…"}</div>`;
+    : `${preview}<div class="clip-preview-note">${c.status === "rendering" ? esc(c.render_stage || "Rendering video") + "…" : c.buffer_pinned ? "Queued · original footage protected while waiting" : "Preparing video…"}</div>`;
   if (full) {
     dlg.innerHTML = `<div class="editor"><div class="stage" id="stage">${stage}</div>
       <div class="panel">
