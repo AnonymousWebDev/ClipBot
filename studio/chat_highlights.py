@@ -53,7 +53,7 @@ def evaluate_chat_spike(
     Returns None for insufficient evidence. All timestamps are *stream seconds*,
     not wall-clock seconds. Missing seconds count as zero messages.
     """
-    if now < baseline_seconds // 2:
+    if now < baseline_seconds + current_seconds + 5:
         return None
     recent_start = now - current_seconds + 1
     baseline_end = recent_start - 5
