@@ -112,6 +112,7 @@ class Session:
         self.words = []
         self.t_done = 0.0             # transcript is complete up to this second
         self.segments = []            # (path, start, end) on the session clock
+        self.pinned = {}              # clip id -> (start, end), protects queued footage from expiry
         self.seg_clock = 0.0
         self.csv_seen = {}
         self.part = 0
@@ -241,8 +242,18 @@ class Session:
                     self.seg_clock += dur
                 self.csv_seen[i] = len(rows)
             keep_from = self.seg_clock - self.settings["buffer_min"] * 60
-            while self.segments and self.segments[0][2] < keep_from:
-                self.segments.pop(0)[0].unlink(missing_ok=True)
+            # A queued render may wait several minutes on a slower PC. Retain every
+            # segment overlapping its requested range, even beyond the rolling window.
+            # Remove individually so a pinned old clip never holds unrelated segments.
+            retained = []
+            for segment in self.segments:
+                path, start, end = segment
+                needed = any(end > lo and start < hi for lo, hi in self.pinned.values())
+                if end < keep_from and not needed:
+                    path.unlink(missing_ok=True)
+                else:
+                    retained.append(segment)
+            self.segments = retained
 
     # ---------------------------------------------------------------- chat (Twitch only)
     def _chat(self, channel):
@@ -526,14 +537,33 @@ class Session:
                  gameplay_box=self.settings.get("gameplay_box"),
                  facecam_version=self.settings.get("facecam_version", 0),
                  captions=False if self.chat_mode else self.job["options"].get("captions", True),
-                 status="queued", version=0, made_at=time.time())
+                 status="queued", version=0, made_at=time.time(),
+                 buffer_pinned=True)
         with self.lock:
+            # Pin the complete range before it enters the single render queue.
+            self.pinned[c["id"]] = (max(0.0, c["start"] - PAD), c["end"] + PAD)
             self.job["clips"].append(c)
         jobs.save(self.job)
         jobs.submit_live(lambda: self._render(c))
 
     def _render(self, clip):
-        """Runs on the render worker: copy the needed buffer pieces, then make the clip."""
+        """Capture original footage first; free its buffer pin before heavy video encoding."""
+        staged = False
+        try:
+            staged = self._stage_clip(clip)
+        except Exception as e:  # noqa: BLE001 - never leave a pinned or permanently queued clip
+            clip.update(status="error", error=f"Could not preserve stream footage: {media_safe(e)}")
+            jobs.save(self.job)
+        finally:
+            with self.lock:
+                self.pinned.pop(clip["id"], None)
+                clip["buffer_pinned"] = False
+            jobs.save(self.job)
+        if staged:
+            jobs.render_one(self.job, clip, list(self.words))
+
+    def _stage_clip(self, clip):
+        """Run only lossless segment copying while original stream pieces are pinned."""
         deadline = time.time() + 45
         while time.time() < deadline:
             self._scan_segments()
@@ -543,9 +573,12 @@ class Session:
         with self.lock:
             segs = [s for s in self.segments if s[2] > clip["start"] - PAD and s[1] < clip["end"] + PAD and s[0].exists()]
         if not segs or segs[0][1] > clip["start"] + 2:
-            clip.update(status="error", error="That part of the stream is no longer in the buffer.")
+            oldest = round(self.segments[0][1], 1) if self.segments else "none"
+            clip.update(status="error",
+                        error=f"Recording pieces missing (requested {clip['start']:.1f}s; oldest {oldest}s). "
+                              "Check the stream is recording before clipping.")
             jobs.save(self.job)
-            return
+            return False
         if "width" not in self.job:
             meta = media.probe(segs[0][0])
             self.job.update(width=meta["width"], height=meta["height"])
@@ -558,7 +591,7 @@ class Session:
         except Exception as e:  # noqa: BLE001
             clip.update(status="error", error=media_safe(e))
             jobs.save(self.job)
-            return
+            return False
         finally:
             lst.unlink(missing_ok=True)
         dur = segs[-1][2] - segs[0][1]
@@ -567,7 +600,8 @@ class Session:
         clip.update(src=str(src), src_offset=round(offset, 2), src_end=round(offset + dur, 2))
         clip["start"] = max(clip["start"], clip["src_offset"])
         clip["end"] = min(clip["end"], clip["src_end"])
-        jobs.render_one(self.job, clip, list(self.words))
+        jobs.save(self.job)
+        return True
 
     def _align(self, src, guess, dur):
         """Where `src` really starts on the transcript clock. The video pieces and the audio feed keep separate
