@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from studio.segment_timeline import (
-    index_rows, latest_video_time, continuous_tail, video_diagnostics,
+    index_rows, latest_video_time, continuous_tail, video_diagnostics, video_stalled, segment_bytes_snapshot,
 )
 
 
@@ -61,6 +61,23 @@ class SegmentTimelineTests(unittest.TestCase):
             indexed = [(files[0], 0.0, 6.0), (files[1], 6.0, 12.0),
                        (files[2], 150.0, 156.0), (files[3], 156.0, 162.0)]
             self.assertEqual(continuous_tail(indexed), (150.0, 162.0))
+
+    def test_stalled_video_with_live_audio_triggers_reconnect(self):
+        # Reproduces the Windows symptom: 128s audio vs a TS output that froze at 30s.
+        self.assertTrue(video_stalled(128, 30, 128))
+        self.assertFalse(video_stalled(40, 30, 40))
+        self.assertFalse(video_stalled(128, 105, 128))
+        self.assertFalse(video_stalled(128, 30, 20))  # warm-up guards bursty HLS data
+
+    def test_latest_ts_byte_progress_does_not_count_empty_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            (folder / "p01_00000.ts").write_bytes(b"video")
+            (folder / "p01_00001.ts").write_bytes(b"")
+            self.assertEqual(segment_bytes_snapshot(folder, "p01"), ("p01_00000.ts", 5))
+            (folder / "p01_00001.ts").write_bytes(b"additional video")
+            self.assertEqual(segment_bytes_snapshot(folder, "p01"), ("p01_00001.ts", 16))
+            self.assertIsNone(segment_bytes_snapshot(folder, "p02"))
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg unavailable")
     def test_real_ffmpeg_segment_csv_is_indexable(self):
