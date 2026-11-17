@@ -1747,6 +1747,8 @@ function everyPick(cid, v) {
 function liveHtml(j) {
   const L = j.live || {elapsed:0, lines:[], level:[], chat:null, checks:0, buffer_sec:0, pending_clips:0};
   const chatMode = L.mode === "chat";
+  const v = L.video || {};
+  const lagWarning = (v.video_lag_sec ?? 0) > 25 && (v.audio_sec ?? 0) > 30;
   return `<div class="livecard">
     <div class="lc-head"><div class="lc-title"><span class="pill live"><span class="dot"></span>Live</span>
         <h3>${esc(j.title || j.source.name)}</h3><p class="sub">${esc(j.uploader)}${j.uploader ? " · " : ""}${esc(j.stage)}</p></div>
@@ -1762,7 +1764,13 @@ function liveHtml(j) {
       ${L.chat ? `<div class="meter"><h4>Chat messages per second</h4>${spark(L.chat, "chat", 0, Math.max(4, ...L.chat))}</div>` : ""}
       <div class="meter"><h4>${chatMode ? "Chat-spike status" : "Latest AI decisions"}</h4><div class="said" style="justify-content:flex-start;color:var(--text)">${chatMode ? `<div class="sub">${L.chat_connected ? "Monitoring chat activity" : "Waiting for Twitch chat connection"} · ${L.chat_spikes || 0} spikes</div>` : (L.verdicts || []).length ? L.verdicts.slice(0, 4).map(v => `<div>${fmt(v.t)} · ${v.transcript != null ? "words " + v.transcript : ""}${v.reaction != null ? " · reaction " + v.reaction : ""} · <span class="sub">${esc(v.result)}</span></div>`).join("") : "<div class='sub'>First check soon…</div>"}</div></div>
       <div class="meter"><h4>${chatMode ? "Transcription" : "What was just said"}</h4><div class="said">${chatMode ? "<div class='sub'>Off in chat-only mode to save CPU. Chat messages are monitored instead.</div>" : L.lines.length ? L.lines.map(t => `<div>${esc(t)}</div>`).join("") : "<div>Listening…</div>"}</div></div>
-    </div>${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}</div>
+    </div>
+    ${L.video ? `<div class="${lagWarning ? "err" : "help"}" style="margin:10px 16px;padding:8px">
+      Recorded video: ${fmt(v.video_sec || 0)} · Audio clock: ${fmt(v.audio_sec || 0)}
+      · Continuous video: ${fmt(v.tail_sec || 0)}
+      ${lagWarning ? " · Video is behind audio. Wait for FFmpeg segments or check ffmpeg.log in the recording folder." : ""}
+      </div>` : ""}
+    ${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}</div>
     ${j.clips.length ? `<div class="grid" style="margin-bottom:28px">${[...j.clips].reverse().map(c => clipHtml(j, c)).join("")}</div>` : ""}`;
 }
 function jobHtml(j) {
