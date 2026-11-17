@@ -142,6 +142,7 @@ class Session:
         self.last_spike = -999.0      # when the last jump was sent to the AI (stream seconds)
         self.base = {}                # running averages the jumps are measured against, shown on the card
         self.spikes = 0
+        self.video_restarts = 0   # FFmpeg restarts after video output freezes but audio continues
 
     # ---------------------------------------------------------------- recording
     def start(self):
@@ -176,6 +177,7 @@ class Session:
 
     def _ingest_loop(self):
         fails = 0
+        stalled_without_video = 0
         url = self.job["source"]["url"]
         while not self.stop_flag.is_set():
             try:
@@ -209,6 +211,11 @@ class Session:
                 self.proc = subprocess.Popen(cmd, cwd=self.buf, stdout=subprocess.PIPE, stderr=errlog,
                                              creationflags=media.NO_WINDOW)
                 got = 0
+                restarted_for_video = False
+                process_started = time.monotonic()
+                last_progress_audio = self.samples / SR
+                checked_audio = last_progress_audio
+                last_snapshot = None
                 while True:
                     data = self.proc.stdout.read(SR * 2)  # one second of 16-bit mono
                     if not data:
@@ -222,7 +229,55 @@ class Session:
                             self.pending += data
                         self.samples += len(data) // 2
                         self.db.append(level)
-                self.proc.wait()
+                        audio_now = self.samples / SR
+                    if self.stop_flag.is_set():
+                        break
+                    if audio_now - checked_audio < 3:
+                        continue
+                    checked_audio = audio_now
+                    # The segment CSV only includes *finalized* files. Track
+                    # growing TS bytes too, so long keyframe intervals do not
+                    # cause false stall alerts.
+                    snapshot = segment_timeline.segment_bytes_snapshot(self.buf, p)
+                    if snapshot and (last_snapshot is None or snapshot[0] != last_snapshot[0]
+                                     or snapshot[1] > last_snapshot[1]):
+                        last_snapshot = snapshot
+                        last_progress_audio = audio_now
+                        if self.job.get("stage") == "Reconnecting video":
+                            self.job["stage"] = "Recording"
+                    if segment_timeline.video_stalled(audio_now, last_progress_audio,
+                                                       time.monotonic() - process_started):
+                        self.video_restarts += 1
+                        self.job["stage"] = "Reconnecting video"
+                        errlog.write(
+                            f"\\n[ClipBot] Video output stalled while audio continued: "
+                            f"{audio_now:.0f}s audio, no TS writes for "
+                            f"{audio_now - last_progress_audio:.0f}s; "
+                            f"reconnecting FFmpeg (attempt {self.video_restarts}).\\n".encode()
+                        )
+                        errlog.flush()
+                        restarted_for_video = True
+                        break
+                if self.proc.poll() is None and (restarted_for_video or self.stop_flag.is_set()):
+                    self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=12)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(timeout=5)
+            if self.stop_flag.is_set():
+                break
+            if restarted_for_video:
+                # Do not spin forever when every fresh source stalls before
+                # yielding even two completed segments.
+                with self.lock:
+                    finished = self.csv_seen.get(current_part, 0)
+                stalled_without_video = 0 if finished >= 2 else stalled_without_video + 1
+                if stalled_without_video >= 4:
+                    self.job["error"] = "Live video repeatedly froze after reconnecting. See ffmpeg.log."
+                    break
+                self.stop_flag.wait(3)
+                continue
             fails = 0 if got > SR * 2 * 20 else fails + 1
             if fails >= 3:
                 break
@@ -692,7 +747,8 @@ class Session:
                       "chat_baseline": self.base,
                       "video": {**segment_timeline.video_diagnostics(
                           elapsed, tail_end, self.segments),
-                          "tail_sec": round(max(0.0, tail_end - tail_start), 1)},
+                          "tail_sec": round(max(0.0, tail_end - tail_start), 1),
+                          "restarts": self.video_restarts},
                       "pending_clips": len(self.manual)})
         jobs.save(self.job)
 
